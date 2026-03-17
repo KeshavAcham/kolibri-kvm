@@ -3,7 +3,7 @@
 A partial implementation of the **KVM (K Virtual Machine)** bytecode interpreter for the
 [KolibriOS J2ME Emulator](http://wiki.kolibrios.org) GSoC 2026 project.
 
-This implements the core execution engine described in the proposal's **Phase 1** milestone:
+
 > *"Implement core KVM: bytecode interpreter, operand stack, local variables"*
 
 ---
