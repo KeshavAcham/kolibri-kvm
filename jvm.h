@@ -115,4 +115,4 @@ JVMResult vm_exec   (VM *vm, const uint8_t *code, uint32_t len,
                      int32_t *ret_val);
 const char *jvm_result_str(JVMResult r);
 
-#endif /* JVM_H */
+#endif /* JVM_H */ 
