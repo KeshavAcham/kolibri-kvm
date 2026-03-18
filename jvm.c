@@ -51,23 +51,38 @@ static JVMResult pop_int(Frame *f, int32_t *n)
     return JVM_OK;
 }
 
-/* Read next byte from bytecode stream */
-static uint8_t fetch_u8(Frame *f)
+/* Read next byte from bytecode stream — returns JVM_ERR_OUT_OF_BOUNDS on overrun */
+static JVMResult fetch_u8(Frame *f, uint8_t *out)
 {
-    return f->code[f->pc++];
+    if (f->pc >= f->code_len) return JVM_ERR_OUT_OF_BOUNDS;
+    *out = f->code[f->pc++];
+    return JVM_OK;
 }
 
 /* Read next signed 16-bit big-endian from bytecode stream */
-static int16_t fetch_i16(Frame *f)
+static JVMResult fetch_i16(Frame *f, int16_t *out)
 {
-    uint8_t hi = fetch_u8(f);
-    uint8_t lo = fetch_u8(f);
-    return (int16_t)((hi << 8) | lo);
+    uint8_t hi, lo;
+    JVMResult r;
+    r = fetch_u8(f, &hi); if (r != JVM_OK) return r;
+    r = fetch_u8(f, &lo); if (r != JVM_OK) return r;
+    *out = (int16_t)((hi << 8) | lo);
+    return JVM_OK;
 }
 
 /* ════════════════════════════════════════════════════════════
- *  VM init
+ *  Convenience macros for safe fetch / pop inside the loop
  * ════════════════════════════════════════════════════════════ */
+#define FETCH_U8(var) \
+    do { JVMResult _r = fetch_u8(f, &(var)); if (_r != JVM_OK) { result = _r; goto done; } } while(0)
+
+#define FETCH_I16(var) \
+    do { JVMResult _r = fetch_i16(f, &(var)); if (_r != JVM_OK) { result = _r; goto done; } } while(0)
+
+#define POP_INT_OR_FAIL(var) \
+    do { JVMResult _r = pop_int(f, &(var)); if (_r != JVM_OK) { result = _r; goto done; } } while(0)
+
+
 
 void vm_init(VM *vm, int verbose)
 {
@@ -97,7 +112,7 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
 
     while (f->pc < f->code_len) {
 
-        uint8_t opcode = fetch_u8(f);
+        uint8_t opcode; FETCH_U8(opcode);
 
         if (vm->verbose)
             printf("  [pc=%3u] opcode=0x%02X  sp=%d\n",
@@ -120,19 +135,19 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
 
         /* ── push small literal ────────────────────────── */
         case OP_BIPUSH: {
-            int8_t val = (int8_t)fetch_u8(f);
-            push_int(f, (int32_t)val);
+            uint8_t raw; FETCH_U8(raw);
+            push_int(f, (int32_t)(int8_t)raw);
             break;
         }
         case OP_SIPUSH: {
-            int16_t val = fetch_i16(f);
+            int16_t val; FETCH_I16(val);
             push_int(f, (int32_t)val);
             break;
         }
 
         /* ── local variable loads ──────────────────────── */
         case OP_ILOAD: {
-            uint8_t idx = fetch_u8(f);
+            uint8_t idx; FETCH_U8(idx);
             if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
             push_int(f, f->locals[idx].ival);
             break;
@@ -144,73 +159,74 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
 
         /* ── local variable stores ─────────────────────── */
         case OP_ISTORE: {
-            uint8_t idx = fetch_u8(f);
+            uint8_t idx; FETCH_U8(idx);
             if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
-            int32_t v; pop_int(f, &v);
+            int32_t v; POP_INT_OR_FAIL(v);
             f->locals[idx].ival = v;
             f->locals[idx].type = VAL_INT;
             break;
         }
-        case OP_ISTORE_0: { int32_t v; pop_int(f,&v); f->locals[0].ival=v; break; }
-        case OP_ISTORE_1: { int32_t v; pop_int(f,&v); f->locals[1].ival=v; break; }
-        case OP_ISTORE_2: { int32_t v; pop_int(f,&v); f->locals[2].ival=v; break; }
-        case OP_ISTORE_3: { int32_t v; pop_int(f,&v); f->locals[3].ival=v; break; }
+        case OP_ISTORE_0: { int32_t v; POP_INT_OR_FAIL(v); f->locals[0].ival=v; f->locals[0].type=VAL_INT; break; }
+        case OP_ISTORE_1: { int32_t v; POP_INT_OR_FAIL(v); f->locals[1].ival=v; f->locals[1].type=VAL_INT; break; }
+        case OP_ISTORE_2: { int32_t v; POP_INT_OR_FAIL(v); f->locals[2].ival=v; f->locals[2].type=VAL_INT; break; }
+        case OP_ISTORE_3: { int32_t v; POP_INT_OR_FAIL(v); f->locals[3].ival=v; f->locals[3].type=VAL_INT; break; }
 
         /* ── arithmetic ────────────────────────────────── */
         case OP_IADD: {
             int32_t b, a;
-            pop_int(f, &b); pop_int(f, &a);
+            POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a);
             push_int(f, a + b);
             break;
         }
         case OP_ISUB: {
             int32_t b, a;
-            pop_int(f, &b); pop_int(f, &a);
+            POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a);
             push_int(f, a - b);
             break;
         }
         case OP_IMUL: {
             int32_t b, a;
-            pop_int(f, &b); pop_int(f, &a);
+            POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a);
             push_int(f, a * b);
             break;
         }
         case OP_IDIV: {
             int32_t b, a;
-            pop_int(f, &b); pop_int(f, &a);
+            POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a);
             if (b == 0) { result = JVM_ERR_DIVIDE_BY_ZERO; goto done; }
             push_int(f, a / b);
             break;
         }
         case OP_IREM: {
             int32_t b, a;
-            pop_int(f, &b); pop_int(f, &a);
+            POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a);
             if (b == 0) { result = JVM_ERR_DIVIDE_BY_ZERO; goto done; }
             push_int(f, a % b);
             break;
         }
         case OP_INEG: {
-            int32_t a; pop_int(f, &a);
+            int32_t a; POP_INT_OR_FAIL(a);
             push_int(f, -a);
             break;
         }
 
         /* ── iinc (increment local variable by constant) ─ */
         case OP_IINC: {
-            uint8_t idx   = fetch_u8(f);
-            int8_t  cnst  = (int8_t)fetch_u8(f);
+            uint8_t idx; FETCH_U8(idx);
+            uint8_t raw; FETCH_U8(raw);
+            int8_t cnst = (int8_t)raw;
             if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
             f->locals[idx].ival += cnst;
             break;
         }
 
         /* ── bitwise / shift ───────────────────────────── */
-        case OP_ISHL:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a << (b & 0x1F)); break; }
-        case OP_ISHR:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a >> (b & 0x1F)); break; }
-        case OP_IUSHR: { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, (int32_t)((uint32_t)a >> (b & 0x1F))); break; }
-        case OP_IAND:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a & b); break; }
-        case OP_IOR:   { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a | b); break; }
-        case OP_IXOR:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a ^ b); break; }
+        case OP_ISHL:  { int32_t b,a; POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a); push_int(f, a << (b & 0x1F)); break; }
+        case OP_ISHR:  { int32_t b,a; POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a); push_int(f, a >> (b & 0x1F)); break; }
+        case OP_IUSHR: { int32_t b,a; POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a); push_int(f, (int32_t)((uint32_t)a >> (b & 0x1F))); break; }
+        case OP_IAND:  { int32_t b,a; POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a); push_int(f, a & b); break; }
+        case OP_IOR:   { int32_t b,a; POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a); push_int(f, a | b); break; }
+        case OP_IXOR:  { int32_t b,a; POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a); push_int(f, a ^ b); break; }
 
         /* ── stack manipulation ────────────────────────── */
         case OP_DUP: {
@@ -226,14 +242,15 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
         }
         case OP_SWAP: {
             Value a, b;
-            stack_pop(f, &a); stack_pop(f, &b);
+            if (stack_pop(f, &a) != JVM_OK || stack_pop(f, &b) != JVM_OK)
+                { result = JVM_ERR_STACK_UNDERFLOW; goto done; }
             stack_push(f, a); stack_push(f, b);
             break;
         }
 
         /* ── type conversion ───────────────────────────── */
         case OP_I2C: {
-            int32_t a; pop_int(f, &a);
+            int32_t a; POP_INT_OR_FAIL(a);
             push_int(f, (int32_t)(uint16_t)a);
             break;
         }
@@ -241,8 +258,8 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
         /* ── branch: single-value comparisons ─────────── */
         case OP_IFEQ: case OP_IFNE: case OP_IFLT:
         case OP_IFGE: case OP_IFGT: case OP_IFLE: {
-            int16_t offset = fetch_i16(f);
-            int32_t v; pop_int(f, &v);
+            int16_t offset; FETCH_I16(offset);
+            int32_t v; POP_INT_OR_FAIL(v);
             int take = 0;
             if      (opcode == OP_IFEQ && v == 0) take = 1;
             else if (opcode == OP_IFNE && v != 0) take = 1;
@@ -250,16 +267,21 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
             else if (opcode == OP_IFGE && v >= 0) take = 1;
             else if (opcode == OP_IFGT && v >  0) take = 1;
             else if (opcode == OP_IFLE && v <= 0) take = 1;
-            if (take) f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
+            if (take) {
+                int32_t target = (int32_t)(f->pc - 3) + offset;
+                if (target < 0 || (uint32_t)target >= f->code_len)
+                    { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+                f->pc = (uint32_t)target;
+            }
             break;
         }
 
         /* ── branch: two-value integer comparisons ─────── */
         case OP_IF_ICMPEQ: case OP_IF_ICMPNE: case OP_IF_ICMPLT:
         case OP_IF_ICMPGE: case OP_IF_ICMPGT: case OP_IF_ICMPLE: {
-            int16_t offset = fetch_i16(f);
+            int16_t offset; FETCH_I16(offset);
             int32_t b, a;
-            pop_int(f, &b); pop_int(f, &a);
+            POP_INT_OR_FAIL(b); POP_INT_OR_FAIL(a);
             int take = 0;
             if      (opcode == OP_IF_ICMPEQ && a == b) take = 1;
             else if (opcode == OP_IF_ICMPNE && a != b) take = 1;
@@ -267,20 +289,28 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
             else if (opcode == OP_IF_ICMPGE && a >= b) take = 1;
             else if (opcode == OP_IF_ICMPGT && a >  b) take = 1;
             else if (opcode == OP_IF_ICMPLE && a <= b) take = 1;
-            if (take) f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
+            if (take) {
+                int32_t target = (int32_t)(f->pc - 3) + offset;
+                if (target < 0 || (uint32_t)target >= f->code_len)
+                    { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+                f->pc = (uint32_t)target;
+            }
             break;
         }
 
         /* ── unconditional jump ────────────────────────── */
         case OP_GOTO: {
-            int16_t offset = fetch_i16(f);
-            f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
+            int16_t offset; FETCH_I16(offset);
+            int32_t target = (int32_t)(f->pc - 3) + offset;
+            if (target < 0 || (uint32_t)target >= f->code_len)
+                { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            f->pc = (uint32_t)target;
             break;
         }
 
         /* ── return ────────────────────────────────────── */
         case OP_IRETURN: {
-            int32_t v; pop_int(f, &v);
+            int32_t v; POP_INT_OR_FAIL(v);
             if (ret_val) *ret_val = v;
             result = JVM_RETURN_INT;
             goto done;
@@ -296,17 +326,15 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
          * Here we print a diagnostic and consume the       *
          * 2-byte index operand.                            */
         case OP_GETSTATIC: {
-            uint16_t idx = (uint16_t)fetch_i16(f);
+            int16_t raw; FETCH_I16(raw); uint16_t idx = (uint16_t)raw;
             (void)idx;
-            /* push a dummy reference so INVOKEVIRTUAL can pop it */
             Value ref = { VAL_REF, 0 };
             stack_push(f, ref);
             break;
         }
         case OP_INVOKEVIRTUAL: {
-            uint16_t idx = (uint16_t)fetch_i16(f);
+            int16_t raw; FETCH_I16(raw); uint16_t idx = (uint16_t)raw;
             (void)idx;
-            /* pop the argument and the object reference */
             Value arg, ref;
             stack_pop(f, &arg);
             stack_pop(f, &ref);
@@ -314,7 +342,7 @@ JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
             break;
         }
         case OP_INVOKESTATIC: {
-            uint16_t idx = (uint16_t)fetch_i16(f);
+            int16_t raw; FETCH_I16(raw); uint16_t idx = (uint16_t)raw;
             (void)idx;
             break;
         }
@@ -351,4 +379,3 @@ const char *jvm_result_str(JVMResult r)
     default:                      return "UNKNOWN";
     }
 }
- 
