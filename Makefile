@@ -1,14 +1,18 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c99 -g
-TARGET  = kvm
 
-all: $(TARGET)
+# test runner (your original main.c)
+test: main.o jvm.o
+	$(CC) $(CFLAGS) -o $@ $^
 
-$(TARGET): jvm.c main.c jvm.h
-	$(CC) $(CFLAGS) -o $(TARGET) jvm.c main.c
+# class loader demo
+kvm: classloader_demo.o jvm.o classfile.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(TARGET)
+	rm -f *.o test kvm
 
-.PHONY: all clean
- 
+.PHONY: clean
