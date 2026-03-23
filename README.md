@@ -280,7 +280,7 @@ Following mentor code review, these correctness issues were resolved:
 ## Roadmap
 
 ```
-Phase 1  ██████████████████░░  ~90% ← you are here
+Phase 1  ██████████████████░░  ~90%
 Phase 2  ░░░░░░░░░░░░░░░░░░░░  CLDC 1.1 libraries, GC, strings, exceptions
 Phase 3  ░░░░░░░░░░░░░░░░░░░░  MIDP 2.0 Display/Canvas, MIDlet lifecycle
 Polish   ░░░░░░░░░░░░░░░░░░░░  Real J2ME app testing, docs, final submission
