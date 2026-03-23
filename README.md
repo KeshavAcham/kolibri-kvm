@@ -55,7 +55,7 @@ manage a Java heap, and execute CLDC 1.1 bytecode — with zero external depende
 ```
 
 | File | Purpose |
-|---|---|
+| --- | --- |
 | `jvm.h` | All structs, opcode constants, result codes — the public API |
 | `jvm.c` | Interpreter loop, heap allocator, mark-and-sweep GC |
 | `classfile.h` | ClassFile, MethodInfo, CPEntry, ClassRegistry types |
@@ -70,7 +70,7 @@ manage a Java heap, and execute CLDC 1.1 bytecode — with zero external depende
 ### ✅ Bytecode Interpreter — 107 opcodes
 
 | Category | Opcodes |
-|---|---|
+| --- | --- |
 | Integer constants | `iconst_m1` … `iconst_5`, `bipush`, `sipush`, `ldc`, `ldc_w` |
 | Float constants | `fconst_0/1/2` |
 | Long constants | `lconst_0/1` |
@@ -97,53 +97,61 @@ manage a Java heap, and execute CLDC 1.1 bytecode — with zero external depende
 | Misc | `nop`, `lconst_0/1` |
 
 ### ✅ Class File Parser
-- Full `.class` file parsing (magic `0xCAFEBABE`, minor/major version)
-- Complete constant pool resolution — all 12 CP tags including `UTF8`, `Class`, `Methodref`, `Fieldref`, `NameAndType`, `String`, `Integer`
-- Method table extraction with `Code` attribute parsing
-- Exception table parsing
-- Field table skipping (with attribute awareness)
+
+* Full `.class` file parsing (magic `0xCAFEBABE`, minor/major version)
+* Complete constant pool resolution — all 12 CP tags including `UTF8`, `Class`, `Methodref`, `Fieldref`, `NameAndType`, `String`, `Integer`
+* Method table extraction with `Code` attribute parsing
+* Exception table parsing
+* Field table skipping (with attribute awareness)
 
 ### ✅ JAR / ZIP Loader
-- Minimal ZIP parser — no external dependencies (no `zlib`, no `miniz`)
-- Reads ZIP central directory to locate all entries
-- Extracts and parses every `.class` file from a JAR
-- Supports STORED (method=0) entries — standard for `.class` files in JARs
+
+* Minimal ZIP parser — no external dependencies (no `zlib`, no `miniz`)
+* Reads ZIP central directory to locate all entries
+* Extracts and parses every `.class` file from a JAR
+* Supports STORED (method=0) entries — standard for `.class` files in JARs
 
 ### ✅ Class Registry
-- Fixed-size class registry supporting up to 64 simultaneously loaded classes
-- O(n) lookup by class name
-- Full lifecycle management with `classfile_free`
+
+* Fixed-size class registry supporting up to 64 simultaneously loaded classes
+* O(n) lookup by class name
+* Full lifecycle management with `classfile_free`
 
 ### ✅ Object Model & Heap
-- `JObject` supports plain objects, int arrays, ref arrays, and strings
-- Reference-based heap — objects addressed by 1-based integer refs (0 = null)
-- `vm_alloc_object`, `vm_alloc_array`, `vm_alloc_string` allocators
-- Null pointer detection on every dereference
-- Array bounds checking on every load and store
+
+* `JObject` supports plain objects, int arrays, ref arrays, and strings
+* Reference-based heap — objects addressed by 1-based integer refs (0 = null)
+* `vm_alloc_object`, `vm_alloc_array`, `vm_alloc_string` allocators
+* Null pointer detection on every dereference
+* Array bounds checking on every load and store
 
 ### ✅ Mark-and-Sweep Garbage Collector
-- Roots scanned from all live frame operand stacks and local variable arrays
-- Recursive marking through object fields and reference array elements
-- Sweep phase frees all unmarked objects and reclaims their memory
-- Zero external allocator dependencies — pure C `malloc`/`free`
+
+* Roots scanned from all live frame operand stacks and local variable arrays
+* Recursive marking through object fields and reference array elements
+* Sweep phase frees all unmarked objects and reclaims their memory
+* Auto-triggered when object count exceeds `GC_THRESHOLD` (384/512 slots)
+* Zero external allocator dependencies — pure C `malloc`/`free`
 
 ### ✅ Robust Error Handling
+
 Every single opcode is hardened against:
-- Buffer over-read (bounds-checked `fetch_u8` / `fetch_i16`)
-- Stack underflow on every `pop` operation
-- Stack overflow on every `push` operation
-- Out-of-bounds branch targets (validated before every jump)
-- Null pointer dereference on object/array access
-- Array index out of bounds
-- Division by zero
-- Invalid local variable indices
-- Truncated bytecode streams
+
+* Buffer over-read (bounds-checked `fetch_u8` / `fetch_i16`)
+* Stack underflow on every `pop` operation
+* Stack overflow on every `push` operation
+* Out-of-bounds branch targets (validated before every jump)
+* Null pointer dereference on object/array access
+* Array index out of bounds
+* Division by zero
+* Invalid local variable indices
+* Truncated bytecode streams
 
 ---
 
 ## Build & Run
 
-```bash
+```
 # Build the test suite
 make test
 ./test
@@ -210,10 +218,25 @@ $ ./kvm Hello.class
 
 ---
 
+## Bug Fixes (post-review)
+
+Following mentor code review, these correctness issues were resolved:
+
+| Bug | Fix |
+| --- | --- |
+| `ldc` pushed CP index instead of value | Now resolves `CP_INTEGER`, `CP_FLOAT`, `CP_STRING` from `CPEntry`; falls back to raw index if no CP attached |
+| `fdiv` returned `1e30f` instead of IEEE 754 Infinity | Removed magic constant — C `float` division produces `+Inf`/`-Inf`/`NaN` natively per IEEE 754 |
+| `fcmpl`/`fcmpg` returned 0 for NaN | Added `isnan()` check — `fcmpl` returns -1, `fcmpg` returns +1 per JVM spec |
+| `invokevirtual` always popped exactly 2 values | Now pops N args + object ref; `count_args()` helper parses method descriptor |
+| `athrow` returned `OUT_OF_BOUNDS` unconditionally | Now walks `exc_table`, finds handler covering throw PC, jumps to `handler_pc` |
+| `vm_alloc_array` leaked `idata`/`rdata` on exit | Added `obj_count` tracking; auto-GC triggers at `GC_THRESHOLD = 384` objects |
+
+---
+
 ## Error codes
 
 | Code | Meaning |
-|---|---|
+| --- | --- |
 | `JVM_OK` | Normal completion |
 | `JVM_RETURN_INT/FLOAT/REF/VOID` | Method returned a value |
 | `JVM_ERR_STACK_OVERFLOW` | Operand stack or frame stack full |
@@ -234,7 +257,7 @@ $ ./kvm Hello.class
 > — GSoC 2026 Proposal, Phase 1
 
 | Deliverable | Status |
-|---|---|
+| --- | --- |
 | Bytecode interpreter (switch-dispatch) | ✅ Complete |
 | Operand stack with full error checking | ✅ Complete |
 | Local variable array (int, float, ref) | ✅ Complete |
@@ -246,10 +269,10 @@ $ ./kvm Hello.class
 | JAR / ZIP loader | ✅ Complete |
 | Java heap + object model | ✅ Complete |
 | Mark-and-sweep GC | ✅ Complete |
+| Exception handler table dispatch (`athrow`) | ✅ Complete |
 | Comprehensive test suite (31 tests) | ✅ Complete |
-| Real method dispatch (invoke*) | 🔄 Phase 2 |
+| Real method dispatch (`invoke*`) | 🔄 Phase 2 |
 | `java.lang` native stubs | 🔄 Phase 2 |
-| Exception handler table dispatch | 🔄 Phase 2 |
 | Long arithmetic (`ladd`, `lmul` …) | 🔄 Phase 2 |
 
 ---
@@ -257,7 +280,7 @@ $ ./kvm Hello.class
 ## Roadmap
 
 ```
-Phase 1  ██████████████████░░  ~85% ← you are here
+Phase 1  ██████████████████░░  ~90% ← you are here
 Phase 2  ░░░░░░░░░░░░░░░░░░░░  CLDC 1.1 libraries, GC, strings, exceptions
 Phase 3  ░░░░░░░░░░░░░░░░░░░░  MIDP 2.0 Display/Canvas, MIDlet lifecycle
 Polish   ░░░░░░░░░░░░░░░░░░░░  Real J2ME app testing, docs, final submission
@@ -267,12 +290,12 @@ Polish   ░░░░░░░░░░░░░░░░░░░░  Real J2ME
 
 ## References
 
-- [JVM Specification (SE 8)](https://docs.oracle.com/javase/specs/jvms/se8/html/)
-- [CLDC 1.1 Specification — JSR 139](https://jcp.org/en/jsr/detail?id=139)
-- [MIDP 2.0 Specification — JSR 118](https://jcp.org/en/jsr/detail?id=118)
-- [phoneME Feature — open-source J2ME](https://github.com/phoneme)
-- [JamVM — lightweight JVM in C](http://jamvm.sourceforge.net)
-- [KolibriOS Developer Wiki](http://wiki.kolibrios.org)
+* [JVM Specification (SE 8)](https://docs.oracle.com/javase/specs/jvms/se8/html/)
+* [CLDC 1.1 Specification — JSR 139](https://jcp.org/en/jsr/detail?id=139)
+* [MIDP 2.0 Specification — JSR 118](https://jcp.org/en/jsr/detail?id=118)
+* [phoneME Feature — open-source J2ME](https://github.com/phoneme)
+* [JamVM — lightweight JVM in C](http://jamvm.sourceforge.net)
+* [KolibriOS Developer Wiki](http://wiki.kolibrios.org)
 
 ---
 
