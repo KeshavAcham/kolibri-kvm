@@ -1,282 +1,524 @@
 #include "jvm.h"
-#include <stdio.h>
-#include <stdlib.h>
+#include <math.h>
 
-/* ════════════════════════════════════════════════════════════
- * Mini test framework
- * ════════════════════════════════════════════════════════════ */
-
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define RUN_TEST(name, code_arr, expected_ret, expected_val) \
-    do { \
-        tests_run++; \
-        VM vm; vm_init(&vm, 0); \
-        int32_t ret = 0; \
-        JVMResult r = vm_exec(&vm, code_arr, sizeof(code_arr), &ret); \
-        if (r == (expected_ret) && ret == (expected_val)) { \
-            printf("  [PASS] %s\n", name); \
-            tests_passed++; \
-        } else { \
-            printf("  [FAIL] %s  result=%s got=%d want=%d\n", \
-                   name, jvm_result_str(r), ret, (int)(expected_val)); \
-        } \
-    } while (0)
-
-/* Error-result test: we only care about the JVMResult, not the return value */
-#define RUN_ERR_TEST(name, code_arr, expected_ret) \
-    do { \
-        tests_run++; \
-        VM vm; vm_init(&vm, 0); \
-        int32_t ret = 0; \
-        JVMResult r = vm_exec(&vm, code_arr, sizeof(code_arr), &ret); \
-        if (r == (expected_ret)) { \
-            printf("  [PASS] %s\n", name); \
-            tests_passed++; \
-        } else { \
-            printf("  [FAIL] %s  result=%s (want %s)\n", \
-                   name, jvm_result_str(r), jvm_result_str(expected_ret)); \
-        } \
-    } while (0)
-
-/* ════════════════════════════════════════════════════════════
- * Original 15 tests
- * ════════════════════════════════════════════════════════════ */
-
-static const uint8_t test_return42[] = { OP_BIPUSH, 42, OP_IRETURN };
-
-static const uint8_t test_add[] = { OP_ICONST_3, OP_ICONST_4, OP_IADD, OP_IRETURN };
-
-static const uint8_t test_sub[] = { OP_BIPUSH, 10, OP_ICONST_3, OP_ISUB, OP_IRETURN };
-
-static const uint8_t test_mul[] = { OP_BIPUSH, 6, OP_BIPUSH, 7, OP_IMUL, OP_IRETURN };
-
-static const uint8_t test_div[] = { OP_BIPUSH, 100, OP_BIPUSH, 4, OP_IDIV, OP_IRETURN };
-
-static const uint8_t test_rem[] = { OP_BIPUSH, 17, OP_BIPUSH, 5, OP_IREM, OP_IRETURN };
-
-static const uint8_t test_locals[] = {
-    OP_BIPUSH, 10, OP_ISTORE_0,
-    OP_BIPUSH, 20, OP_ISTORE_1,
-    OP_ILOAD_0, OP_ILOAD_1, OP_IADD, OP_IRETURN
-};
-
-static const uint8_t test_iinc[] = {
-    OP_BIPUSH, 5, OP_ISTORE_0,
-    OP_IINC, 0, 3,
-    OP_ILOAD_0, OP_IRETURN
-};
-
-static const uint8_t test_branch[] = {
-    /* 0 */ OP_BIPUSH, 7,
-    /* 2 */ OP_ISTORE_0,
-    /* 3 */ OP_ILOAD_0,
-    /* 4 */ OP_BIPUSH, 5,
-    /* 6 */ OP_IF_ICMPLE, 0x00, 0x05,
-    /* 9 */ OP_ICONST_1,
-    /*10 */ OP_IRETURN,
-    /*11 */ OP_ICONST_0,
-    /*12 */ OP_IRETURN
-};
-
-static const uint8_t test_loop[] = {
-    /* 0 */ OP_ICONST_0,
-    /* 1 */ OP_ISTORE_0,
-    /* 2 */ OP_ICONST_1,
-    /* 3 */ OP_ISTORE_1,
-    /* 4 */ OP_ILOAD_0,
-    /* 5 */ OP_ILOAD_1,
-    /* 6 */ OP_IADD,
-    /* 7 */ OP_ISTORE_0,
-    /* 8 */ OP_IINC, 1, 1,
-    /*11 */ OP_ILOAD_1,
-    /*12 */ OP_BIPUSH, 5,
-    /*14 */ OP_IF_ICMPLE, 0xFF, 0xF6,
-    /*17 */ OP_ILOAD_0,
-    /*18 */ OP_IRETURN
-};
-
-static const uint8_t test_sipush[]  = { OP_SIPUSH, 0x03, 0xE8, OP_IRETURN };
-static const uint8_t test_neg[]     = { OP_BIPUSH, 42, OP_INEG, OP_IRETURN };
-static const uint8_t test_and[]     = { OP_SIPUSH, 0x00, 0xFF, OP_BIPUSH, 0x0F, OP_IAND, OP_IRETURN };
-static const uint8_t test_shl[]     = { OP_ICONST_1, OP_ICONST_3, OP_ISHL, OP_IRETURN };
-static const uint8_t test_dup[]     = { OP_ICONST_5, OP_DUP, OP_IADD, OP_IRETURN };
-
-/* ════════════════════════════════════════════════════════════
- * New tests for previously missing opcodes
- * ════════════════════════════════════════════════════════════ */
-
-/* fconst_1 / fconst_2 — push float constants (result cast to int via store trick) */
-/* We just verify they don't crash (return VOID) */
-static const uint8_t test_fconst[] = { OP_FCONST_1, OP_POP, OP_FCONST_2, OP_POP, OP_RETURN };
-
-/* aconst_null — push a null reference */
-static const uint8_t test_aconst_null[] = { OP_ACONST_NULL, OP_POP, OP_RETURN };
-
-/* i2b — int to byte (sign-extend 8-bit) */
-static const uint8_t test_i2b[] = { OP_SIPUSH, 0x01, 0x80, OP_I2B, OP_IRETURN };
-/* 0x0180 = 384; (int8_t)384 = (int8_t)0x80 = -128 */
-
-/* i2s — int to short */
-static const uint8_t test_i2s[] = { OP_SIPUSH, 0x01, 0x00, OP_I2S, OP_IRETURN };
-/* 0x0100 = 256; (int16_t)256 = 256 */
-
-/* dup_x1 — dup top, insert below second */
-/* stack before: [2, 1] (top=1), after: [2, 1, 2] — add → [2, 3], add → 5 */
-static const uint8_t test_dup_x1[] = {
-    OP_ICONST_1,    /* stack: [1]       */
-    OP_ICONST_2,    /* stack: [1, 2]    */
-    OP_DUP_X1,     /* stack: [2, 1, 2] */
-    OP_IADD,        /* stack: [2, 3]    */
-    OP_IADD,        /* stack: [5]       */
-    OP_IRETURN
-};
-
-/* pop2 — discard two values
- * Stack grows upward; push 5, push 3, push 99, push 99.
- * POP2 removes the top two (99, 99), leaving [5, 3].
- * ISUB: 5 - 3 = 2. */
-static const uint8_t test_pop2[] = {
-    OP_ICONST_5,
-    OP_ICONST_3,
-    OP_BIPUSH, 99,
-    OP_BIPUSH, 99,
-    OP_POP2,        /* discard top two (99, 99) */
-    OP_ISUB,        /* 5 - 3 = 2 */
-    OP_IRETURN
-};
-
-/* swap */
-static const uint8_t test_swap[] = {
-    OP_BIPUSH, 10,
-    OP_BIPUSH, 3,
-    OP_SWAP,        /* stack: [3, 10] */
-    OP_ISUB,        /* 3 - 10 = -7 */
-    OP_IRETURN
-};
-
-/* aload_0 / astore_0 — store/load a ref via locals */
-static const uint8_t test_astore_aload[] = {
-    OP_ACONST_NULL,
-    OP_ASTORE_0,
-    OP_ALOAD_0,
-    OP_POP,
-    OP_BIPUSH, 42,
-    OP_IRETURN
-};
-
-/* ifnull — branch if ref is null
- *
- * offset | bytes       | mnemonic
- *      0 | 01          | aconst_null
- *      1 | C6 00 05    | ifnull +5  → target = (4-3)+5 = 6
- *      4 | 03          | iconst_0
- *      5 | AC          | ireturn  ← not-null path (not taken)
- *      6 | 04          | iconst_1
- *      7 | AC          | ireturn  ← null path (taken)
- *
- * aconst_null → ifnull taken → return 1
- */
-static const uint8_t test_ifnull[] = {
-    /* 0 */ OP_ACONST_NULL,
-    /* 1 */ OP_IFNULL, 0x00, 0x05,
-    /* 4 */ OP_ICONST_0,
-    /* 5 */ OP_IRETURN,
-    /* 6 */ OP_ICONST_1,
-    /* 7 */ OP_IRETURN
-};
-
-/* newarray + arraylength (stubs — just verify no crash, length = 0) */
-static const uint8_t test_newarray[] = {
-    OP_BIPUSH, 10,
-    OP_NEWARRAY, T_INT,
-    OP_ARRAYLENGTH,
-    OP_IRETURN
-};
-
-/* ════════════════════════════════════════════════════════════
- * Error-condition tests (fix verification)
- * ════════════════════════════════════════════════════════════ */
-
-/* FIX #3: fetch_u8 bounds check — bipush with no operand */
-static const uint8_t test_truncated_bipush[] = { OP_BIPUSH }; /* no operand byte */
-
-/* FIX #4: stack underflow propagates from arithmetic */
-static const uint8_t test_underflow_iadd[] = { OP_IADD, OP_IRETURN };
-
-/* FIX #5: goto with out-of-bounds target */
-static const uint8_t test_bad_goto[] = { OP_GOTO, 0x7F, 0xFF }; /* huge forward jump */
-
-/* FIX #5: negative branch wraps */
-static const uint8_t test_bad_branch_neg[] = {
-    OP_ICONST_0,
-    OP_IFEQ, 0xFF, 0x00  /* offset -256 from pc=4 → target = 4-3-256 = negative */
-};
-
-/* divide by zero */
-static const uint8_t test_div_zero[] = { OP_ICONST_1, OP_ICONST_0, OP_IDIV, OP_IRETURN };
-
-/* ════════════════════════════════════════════════════════════
- * Verbose demo
- * ════════════════════════════════════════════════════════════ */
-
-static void demo_verbose(void)
-{
-    printf("\n── Verbose trace: 3 + 4 ──\n");
-    VM vm; vm_init(&vm, 1);
-    int32_t ret = 0;
-    vm_exec(&vm, test_add, sizeof(test_add), &ret);
-    printf("  result = %d\n\n", ret);
+/* ── human-readable result names ── */
+const char *jvm_result_str(JVMResult r) {
+    switch (r) {
+        case JVM_OK:                    return "OK";
+        case JVM_RETURN_INT:            return "RETURN_INT";
+        case JVM_RETURN_VOID:           return "RETURN_VOID";
+        case JVM_RETURN_REF:            return "RETURN_REF";
+        case JVM_RETURN_FLOAT:          return "RETURN_FLOAT";
+        case JVM_ERR_STACK_OVERFLOW:    return "ERR_STACK_OVERFLOW";
+        case JVM_ERR_STACK_UNDERFLOW:   return "ERR_STACK_UNDERFLOW";
+        case JVM_ERR_UNKNOWN_OPCODE:    return "ERR_UNKNOWN_OPCODE";
+        case JVM_ERR_DIVIDE_BY_ZERO:    return "ERR_DIVIDE_BY_ZERO";
+        case JVM_ERR_OUT_OF_BOUNDS:     return "ERR_OUT_OF_BOUNDS";
+        case JVM_ERR_NO_FRAME:          return "ERR_NO_FRAME";
+        case JVM_ERR_TRUNCATED_BYTECODE:return "ERR_TRUNCATED_BYTECODE";
+        case JVM_ERR_NULL_POINTER:      return "ERR_NULL_POINTER";
+        case JVM_ERR_ARRAY_INDEX:       return "ERR_ARRAY_INDEX";
+        case JVM_ERR_OUT_OF_MEMORY:     return "ERR_OUT_OF_MEMORY";
+        case JVM_ERR_NEGATIVE_ARRAY_SIZE:return "ERR_NEGATIVE_ARRAY_SIZE";
+        default:                        return "UNKNOWN";
+    }
 }
 
-/* ════════════════════════════════════════════════════════════
- * Entry point
- * ════════════════════════════════════════════════════════════ */
+/* ── initialise VM ── */
+void vm_init(VM *vm, int verbose) {
+    memset(vm, 0, sizeof(VM));
+    vm->fp      = -1;
+    vm->verbose = verbose;
+    vm->obj_count = 0;
+}
 
-int main(void)
+/* ── helpers ── */
+
+/* bounds-checked bytecode fetch */
+static JVMResult fetch_u8(Frame *f, uint8_t *out) {
+    if (f->pc >= f->code_len) return JVM_ERR_OUT_OF_BOUNDS;
+    *out = f->code[f->pc++];
+    return JVM_OK;
+}
+
+static JVMResult fetch_i16(Frame *f, int16_t *out) {
+    if (f->pc + 2 > f->code_len) return JVM_ERR_OUT_OF_BOUNDS;
+    *out = (int16_t)((f->code[f->pc] << 8) | f->code[f->pc + 1]);
+    f->pc += 2;
+    return JVM_OK;
+}
+
+/* stack push / pop with overflow/underflow checks */
+static JVMResult push(Frame *f, Value v) {
+    if (f->sp + 1 >= MAX_STACK) return JVM_ERR_STACK_OVERFLOW;
+    f->stack[++f->sp] = v;
+    return JVM_OK;
+}
+
+static JVMResult push_int(Frame *f, int32_t v) {
+    Value val; val.type = VAL_INT; val.ival = v;
+    return push(f, val);
+}
+
+static JVMResult push_float(Frame *f, float v) {
+    Value val; val.type = VAL_FLOAT; val.fval = v;
+    return push(f, val);
+}
+
+static JVMResult push_ref(Frame *f, int32_t ref) {
+    Value val; val.type = VAL_REF; val.ival = ref;
+    return push(f, val);
+}
+
+static JVMResult pop(Frame *f, Value *out) {
+    if (f->sp < 0) return JVM_ERR_STACK_UNDERFLOW;
+    *out = f->stack[f->sp--];
+    return JVM_OK;
+}
+
+static JVMResult pop_int(Frame *f, int32_t *out) {
+    Value v; JVMResult r = pop(f, &v); if (r) return r;
+    *out = v.ival;
+    return JVM_OK;
+}
+
+static JVMResult pop_float(Frame *f, float *out) {
+    Value v; JVMResult r = pop(f, &v); if (r) return r;
+    *out = v.fval;
+    return JVM_OK;
+}
+
+/* ── simple object heap ── */
+static int vm_alloc_array_int(VM *vm, int32_t count, int32_t *ref_out) {
+    if (count < 0) return JVM_ERR_NEGATIVE_ARRAY_SIZE;
+    if (vm->obj_count >= MAX_OBJECTS) return JVM_ERR_OUT_OF_MEMORY;
+    int idx = vm->obj_count++;
+    JObject *obj = &vm->heap[idx];
+    memset(obj, 0, sizeof(JObject));
+    obj->type   = OBJ_INT_ARRAY;
+    obj->length = count;
+    obj->marked = 0;
+    if (count > 0) {
+        obj->idata = (int32_t *)calloc((size_t)count, sizeof(int32_t));
+        if (!obj->idata) return JVM_ERR_OUT_OF_MEMORY;
+    }
+    *ref_out = idx + 1;   /* 1-based ref; 0 = null */
+    return JVM_OK;
+}
+
+/* ── the interpreter ── */
+JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
+                  int32_t *ret_val)
 {
-    printf("╔══════════════════════════════════════════╗\n");
-    printf("║  KolibriOS J2ME KVM — Bytecode Tests     ║\n");
-    printf("╚══════════════════════════════════════════╝\n\n");
+    /* push an initial frame */
+    if (vm->fp + 1 >= MAX_FRAMES) return JVM_ERR_STACK_OVERFLOW;
+    Frame *f = &vm->frames[++vm->fp];
+    memset(f, 0, sizeof(Frame));
+    f->code     = code;
+    f->code_len = len;
+    f->pc       = 0;
+    f->sp       = -1;
 
-    printf("── Original 15 tests ──\n");
-    RUN_TEST("return 42",           test_return42,  JVM_RETURN_INT,  42);
-    RUN_TEST("3 + 4 = 7",           test_add,       JVM_RETURN_INT,  7);
-    RUN_TEST("10 - 3 = 7",          test_sub,       JVM_RETURN_INT,  7);
-    RUN_TEST("6 * 7 = 42",          test_mul,       JVM_RETURN_INT,  42);
-    RUN_TEST("100 / 4 = 25",        test_div,       JVM_RETURN_INT,  25);
-    RUN_TEST("17 %% 5 = 2",         test_rem,       JVM_RETURN_INT,  2);
-    RUN_TEST("locals: 10+20 = 30",  test_locals,    JVM_RETURN_INT,  30);
-    RUN_TEST("iinc: 5+3 = 8",       test_iinc,      JVM_RETURN_INT,  8);
-    RUN_TEST("branch: 7>5 → 1",     test_branch,    JVM_RETURN_INT,  1);
-    RUN_TEST("loop: sum(1..5)=15",  test_loop,      JVM_RETURN_INT,  15);
-    RUN_TEST("sipush 1000",         test_sipush,    JVM_RETURN_INT,  1000);
-    RUN_TEST("neg: -42",            test_neg,       JVM_RETURN_INT,  -42);
-    RUN_TEST("0xFF & 0x0F = 15",    test_and,       JVM_RETURN_INT,  15);
-    RUN_TEST("1 << 3 = 8",          test_shl,       JVM_RETURN_INT,  8);
-    RUN_TEST("dup: 5+5 = 10",       test_dup,       JVM_RETURN_INT,  10);
+    JVMResult r;
+    *ret_val = 0;
 
-    printf("\n── New opcode tests (issue #2) ──\n");
-    RUN_TEST("fconst_1/2 no crash",    test_fconst,       JVM_RETURN_VOID, 0);
-    RUN_TEST("aconst_null no crash",   test_aconst_null,  JVM_RETURN_VOID, 0);
-    RUN_TEST("i2b: 0x180 → -128",      test_i2b,          JVM_RETURN_INT,  -128);
-    RUN_TEST("i2s: 0x100 → 256",       test_i2s,          JVM_RETURN_INT,  256);
-    RUN_TEST("dup_x1: result = 5",     test_dup_x1,       JVM_RETURN_INT,  5);
-    RUN_TEST("pop2: 5-3 = 2",          test_pop2,         JVM_RETURN_INT,  2);
-    RUN_TEST("swap: 3-10 = -7",        test_swap,         JVM_RETURN_INT,  -7);
-    RUN_TEST("astore/aload_0",         test_astore_aload, JVM_RETURN_INT,  42);
-    RUN_TEST("ifnull: null → 1",       test_ifnull,       JVM_RETURN_INT,  1);
-    RUN_TEST("newarray+arraylength",   test_newarray,     JVM_RETURN_INT,  0);
+    for (;;) {
+        uint8_t op;
+        r = fetch_u8(f, &op);
+        if (r) return r;
 
-    printf("\n── Error-condition tests (fixes #3 #4 #5) ──\n");
-    RUN_ERR_TEST("fix#3: truncated bipush",    test_truncated_bipush,  JVM_ERR_TRUNCATED_BYTECODE);
-    RUN_ERR_TEST("fix#4: underflow in iadd",   test_underflow_iadd,    JVM_ERR_STACK_UNDERFLOW);
-    RUN_ERR_TEST("fix#5: bad goto forward",    test_bad_goto,          JVM_ERR_OUT_OF_BOUNDS);
-    RUN_ERR_TEST("fix#5: bad branch negative", test_bad_branch_neg,    JVM_ERR_OUT_OF_BOUNDS);
-    RUN_ERR_TEST("divide by zero",             test_div_zero,          JVM_ERR_DIVIDE_BY_ZERO);
+        if (vm->verbose)
+            printf("  [pc=%3u] opcode=0x%02X  sp=%d\n",
+                   f->pc - 1, op, f->sp);
 
-    printf("\n%d / %d tests passed\n", tests_passed, tests_run);
-    demo_verbose();
-    return (tests_passed == tests_run) ? 0 : 1;
+        switch (op) {
+
+        /* ── constants ── */
+        case OP_NOP: break;
+
+        case OP_ACONST_NULL: r = push_ref(f, 0);  if (r) return r; break;
+
+        case OP_ICONST_M1: r = push_int(f, -1); if (r) return r; break;
+        case OP_ICONST_0:  r = push_int(f,  0); if (r) return r; break;
+        case OP_ICONST_1:  r = push_int(f,  1); if (r) return r; break;
+        case OP_ICONST_2:  r = push_int(f,  2); if (r) return r; break;
+        case OP_ICONST_3:  r = push_int(f,  3); if (r) return r; break;
+        case OP_ICONST_4:  r = push_int(f,  4); if (r) return r; break;
+        case OP_ICONST_5:  r = push_int(f,  5); if (r) return r; break;
+
+        case OP_FCONST_0:  r = push_float(f, 0.0f); if (r) return r; break;
+        case OP_FCONST_1:  r = push_float(f, 1.0f); if (r) return r; break;
+        case OP_FCONST_2:  r = push_float(f, 2.0f); if (r) return r; break;
+
+        case OP_BIPUSH: {
+            uint8_t b; r = fetch_u8(f, &b); if (r) return r;
+            r = push_int(f, (int32_t)(int8_t)b); if (r) return r;
+            break;
+        }
+        case OP_SIPUSH: {
+            int16_t s; r = fetch_i16(f, &s); if (r) return r;
+            r = push_int(f, (int32_t)s); if (r) return r;
+            break;
+        }
+
+        /* ── loads ── */
+        case OP_ILOAD: {
+            uint8_t idx; r = fetch_u8(f, &idx); if (r) return r;
+            if (idx >= MAX_LOCALS) return JVM_ERR_OUT_OF_BOUNDS;
+            r = push(f, f->locals[idx]); if (r) return r;
+            break;
+        }
+        case OP_ILOAD_0: r = push(f, f->locals[0]); if (r) return r; break;
+        case OP_ILOAD_1: r = push(f, f->locals[1]); if (r) return r; break;
+        case OP_ILOAD_2: r = push(f, f->locals[2]); if (r) return r; break;
+        case OP_ILOAD_3: r = push(f, f->locals[3]); if (r) return r; break;
+
+        case OP_ALOAD: {
+            uint8_t idx; r = fetch_u8(f, &idx); if (r) return r;
+            if (idx >= MAX_LOCALS) return JVM_ERR_OUT_OF_BOUNDS;
+            r = push(f, f->locals[idx]); if (r) return r;
+            break;
+        }
+        case OP_ALOAD_0: r = push(f, f->locals[0]); if (r) return r; break;
+        case OP_ALOAD_1: r = push(f, f->locals[1]); if (r) return r; break;
+        case OP_ALOAD_2: r = push(f, f->locals[2]); if (r) return r; break;
+        case OP_ALOAD_3: r = push(f, f->locals[3]); if (r) return r; break;
+
+        /* ── stores ── */
+        case OP_ISTORE: {
+            uint8_t idx; r = fetch_u8(f, &idx); if (r) return r;
+            if (idx >= MAX_LOCALS) return JVM_ERR_OUT_OF_BOUNDS;
+            Value v; r = pop(f, &v); if (r) return r;
+            f->locals[idx] = v;
+            break;
+        }
+        case OP_ISTORE_0: { Value v; r=pop(f,&v); if(r) return r; f->locals[0]=v; break; }
+        case OP_ISTORE_1: { Value v; r=pop(f,&v); if(r) return r; f->locals[1]=v; break; }
+        case OP_ISTORE_2: { Value v; r=pop(f,&v); if(r) return r; f->locals[2]=v; break; }
+        case OP_ISTORE_3: { Value v; r=pop(f,&v); if(r) return r; f->locals[3]=v; break; }
+
+        case OP_ASTORE: {
+            uint8_t idx; r = fetch_u8(f, &idx); if (r) return r;
+            if (idx >= MAX_LOCALS) return JVM_ERR_OUT_OF_BOUNDS;
+            Value v; r = pop(f, &v); if (r) return r;
+            f->locals[idx] = v;
+            break;
+        }
+        case OP_ASTORE_0: { Value v; r=pop(f,&v); if(r) return r; f->locals[0]=v; break; }
+        case OP_ASTORE_1: { Value v; r=pop(f,&v); if(r) return r; f->locals[1]=v; break; }
+        case OP_ASTORE_2: { Value v; r=pop(f,&v); if(r) return r; f->locals[2]=v; break; }
+        case OP_ASTORE_3: { Value v; r=pop(f,&v); if(r) return r; f->locals[3]=v; break; }
+
+        /* ── array load/store ── */
+        case OP_IALOAD: {
+            int32_t idx; r = pop_int(f, &idx); if (r) return r;
+            int32_t ref; r = pop_int(f, &ref); if (r) return r;
+            if (ref == 0) return JVM_ERR_NULL_POINTER;
+            JObject *obj = &vm->heap[ref - 1];
+            if (idx < 0 || idx >= obj->length) return JVM_ERR_ARRAY_INDEX;
+            r = push_int(f, obj->idata[idx]); if (r) return r;
+            break;
+        }
+        case OP_IASTORE: {
+            int32_t val; r = pop_int(f, &val); if (r) return r;
+            int32_t idx; r = pop_int(f, &idx); if (r) return r;
+            int32_t ref; r = pop_int(f, &ref); if (r) return r;
+            if (ref == 0) return JVM_ERR_NULL_POINTER;
+            JObject *obj = &vm->heap[ref - 1];
+            if (idx < 0 || idx >= obj->length) return JVM_ERR_ARRAY_INDEX;
+            obj->idata[idx] = val;
+            break;
+        }
+
+        /* ── stack ops ── */
+        case OP_POP: {
+            Value v; r = pop(f, &v); if (r) return r;
+            break;
+        }
+        case OP_POP2: {
+            Value v; r = pop(f, &v); if (r) return r;
+            r = pop(f, &v); if (r) return r;
+            break;
+        }
+        case OP_DUP: {
+            if (f->sp < 0) return JVM_ERR_STACK_UNDERFLOW;
+            r = push(f, f->stack[f->sp]); if (r) return r;
+            break;
+        }
+        case OP_DUP_X1: {
+            if (f->sp < 1) return JVM_ERR_STACK_UNDERFLOW;
+            Value a = f->stack[f->sp];
+            Value b = f->stack[f->sp - 1];
+            f->stack[f->sp - 1] = a;
+            f->stack[f->sp]     = b;
+            r = push(f, a); if (r) return r;
+            break;
+        }
+        case OP_SWAP: {
+            if (f->sp < 1) return JVM_ERR_STACK_UNDERFLOW;
+            Value tmp = f->stack[f->sp];
+            f->stack[f->sp]     = f->stack[f->sp - 1];
+            f->stack[f->sp - 1] = tmp;
+            break;
+        }
+
+        /* ── int arithmetic ── */
+        case OP_IADD: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a+b); if(r) return r; break;
+        }
+        case OP_ISUB: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a-b); if(r) return r; break;
+        }
+        case OP_IMUL: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a*b); if(r) return r; break;
+        }
+        case OP_IDIV: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            if (b == 0) return JVM_ERR_DIVIDE_BY_ZERO;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a/b); if(r) return r; break;
+        }
+        case OP_IREM: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            if (b == 0) return JVM_ERR_DIVIDE_BY_ZERO;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a%b); if(r) return r; break;
+        }
+        case OP_INEG: {
+            int32_t a; r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, -a); if(r) return r; break;
+        }
+
+        /* ── bitwise / shift ── */
+        case OP_ISHL: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a << (b & 0x1f)); if(r) return r; break;
+        }
+        case OP_ISHR: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a >> (b & 0x1f)); if(r) return r; break;
+        }
+        case OP_IUSHR: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, (int32_t)((uint32_t)a >> (b & 0x1f))); if(r) return r; break;
+        }
+        case OP_IAND: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a&b); if(r) return r; break;
+        }
+        case OP_IOR: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a|b); if(r) return r; break;
+        }
+        case OP_IXOR: {
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a^b); if(r) return r; break;
+        }
+
+        /* ── float arithmetic ── */
+        case OP_FADD: {
+            float b, a; r=pop_float(f,&b); if(r) return r;
+            r=pop_float(f,&a); if(r) return r;
+            r=push_float(f, a+b); if(r) return r; break;
+        }
+        case OP_FSUB: {
+            float b, a; r=pop_float(f,&b); if(r) return r;
+            r=pop_float(f,&a); if(r) return r;
+            r=push_float(f, a-b); if(r) return r; break;
+        }
+        case OP_FMUL: {
+            float b, a; r=pop_float(f,&b); if(r) return r;
+            r=pop_float(f,&a); if(r) return r;
+            r=push_float(f, a*b); if(r) return r; break;
+        }
+        case OP_FDIV: {
+            float b, a; r=pop_float(f,&b); if(r) return r;
+            r=pop_float(f,&a); if(r) return r;
+            r=push_float(f, a/b); if(r) return r; break;
+        }
+        case OP_FREM: {
+            float b, a; r=pop_float(f,&b); if(r) return r;
+            r=pop_float(f,&a); if(r) return r;
+            r=push_float(f, fmodf(a,b)); if(r) return r; break;
+        }
+        case OP_FNEG: {
+            float a; r=pop_float(f,&a); if(r) return r;
+            r=push_float(f, -a); if(r) return r; break;
+        }
+
+        /* ── type conversions ── */
+        case OP_I2F: {
+            int32_t a; r=pop_int(f,&a); if(r) return r;
+            r=push_float(f, (float)a); if(r) return r; break;
+        }
+        case OP_F2I: {
+            float a; r=pop_float(f,&a); if(r) return r;
+            r=push_int(f, (int32_t)a); if(r) return r; break;
+        }
+        case OP_I2B: {
+            int32_t a; r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, (int32_t)(int8_t)a); if(r) return r; break;
+        }
+        case OP_I2C: {
+            int32_t a; r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, a & 0xFFFF); if(r) return r; break;
+        }
+        case OP_I2S: {
+            int32_t a; r=pop_int(f,&a); if(r) return r;
+            r=push_int(f, (int32_t)(int16_t)a); if(r) return r; break;
+        }
+
+        /* ── iinc ── */
+        case OP_IINC: {
+            uint8_t idx; r = fetch_u8(f, &idx); if (r) return r;
+            uint8_t cv;  r = fetch_u8(f, &cv);  if (r) return r;
+            if (idx >= MAX_LOCALS) return JVM_ERR_OUT_OF_BOUNDS;
+            f->locals[idx].ival += (int32_t)(int8_t)cv;
+            break;
+        }
+
+        /* ── branches (single operand) ── */
+        case OP_IFEQ: case OP_IFNE: case OP_IFLT:
+        case OP_IFGE: case OP_IFGT: case OP_IFLE: {
+            uint32_t branch_pc = f->pc - 1;
+            int16_t offset; r = fetch_i16(f, &offset); if (r) return r;
+            int32_t val; r = pop_int(f, &val); if (r) return r;
+            int take = 0;
+            switch (op) {
+                case OP_IFEQ: take = (val == 0); break;
+                case OP_IFNE: take = (val != 0); break;
+                case OP_IFLT: take = (val <  0); break;
+                case OP_IFGE: take = (val >= 0); break;
+                case OP_IFGT: take = (val >  0); break;
+                case OP_IFLE: take = (val <= 0); break;
+            }
+            if (take) {
+                int32_t target = (int32_t)branch_pc + offset;
+                if (target < 0 || (uint32_t)target >= f->code_len)
+                    return JVM_ERR_OUT_OF_BOUNDS;
+                f->pc = (uint32_t)target;
+            }
+            break;
+        }
+
+        /* ── branches (two int operands) ── */
+        case OP_IF_ICMPEQ: case OP_IF_ICMPNE: case OP_IF_ICMPLT:
+        case OP_IF_ICMPGE: case OP_IF_ICMPGT: case OP_IF_ICMPLE: {
+            uint32_t branch_pc = f->pc - 1;
+            int16_t offset; r = fetch_i16(f, &offset); if (r) return r;
+            int32_t b, a; r=pop_int(f,&b); if(r) return r;
+            r=pop_int(f,&a); if(r) return r;
+            int take = 0;
+            switch (op) {
+                case OP_IF_ICMPEQ: take = (a == b); break;
+                case OP_IF_ICMPNE: take = (a != b); break;
+                case OP_IF_ICMPLT: take = (a <  b); break;
+                case OP_IF_ICMPGE: take = (a >= b); break;
+                case OP_IF_ICMPGT: take = (a >  b); break;
+                case OP_IF_ICMPLE: take = (a <= b); break;
+            }
+            if (take) {
+                int32_t target = (int32_t)branch_pc + offset;
+                if (target < 0 || (uint32_t)target >= f->code_len)
+                    return JVM_ERR_OUT_OF_BOUNDS;
+                f->pc = (uint32_t)target;
+            }
+            break;
+        }
+
+        /* ── null/ref branches ── */
+        case OP_IFNULL: case OP_IFNONNULL: {
+            uint32_t branch_pc = f->pc - 1;
+            int16_t offset; r = fetch_i16(f, &offset); if (r) return r;
+            Value v; r = pop(f, &v); if (r) return r;
+            int take = (op == OP_IFNULL) ? (v.ival == 0) : (v.ival != 0);
+            if (take) {
+                int32_t target = (int32_t)branch_pc + offset;
+                if (target < 0 || (uint32_t)target >= f->code_len)
+                    return JVM_ERR_OUT_OF_BOUNDS;
+                f->pc = (uint32_t)target;
+            }
+            break;
+        }
+
+        /* ── goto ── */
+        case OP_GOTO: {
+            uint32_t branch_pc = f->pc - 1;
+            int16_t offset; r = fetch_i16(f, &offset); if (r) return r;
+            int32_t target = (int32_t)branch_pc + offset;
+            if (target < 0 || (uint32_t)target >= f->code_len)
+                return JVM_ERR_OUT_OF_BOUNDS;
+            f->pc = (uint32_t)target;
+            break;
+        }
+
+        /* ── returns ── */
+        case OP_IRETURN: {
+            int32_t v; r = pop_int(f, &v); if (r) return r;
+            *ret_val = v;
+            vm->fp--;
+            return JVM_RETURN_INT;
+        }
+        case OP_FRETURN: {
+            float v; r = pop_float(f, &v); if (r) return r;
+            *ret_val = (int32_t)v;
+            vm->fp--;
+            return JVM_RETURN_FLOAT;
+        }
+        case OP_ARETURN: {
+            Value v; r = pop(f, &v); if (r) return r;
+            *ret_val = v.ival;
+            vm->fp--;
+            return JVM_RETURN_REF;
+        }
+        case OP_RETURN: {
+            vm->fp--;
+            return JVM_RETURN_VOID;
+        }
+
+        /* ── newarray ── */
+        case OP_NEWARRAY: {
+            uint8_t atype; r = fetch_u8(f, &atype); if (r) return r;
+            int32_t count; r = pop_int(f, &count); if (r) return r;
+            int32_t ref;
+            JVMResult ar = vm_alloc_array_int(vm, count, &ref);
+            if (ar) return ar;
+            r = push_ref(f, ref); if (r) return r;
+            break;
+        }
+
+        /* ── arraylength ── */
+        case OP_ARRAYLENGTH: {
+            int32_t ref; r = pop_int(f, &ref); if (r) return r;
+            if (ref == 0) return JVM_ERR_NULL_POINTER;
+            JObject *obj = &vm->heap[ref - 1];
+            r = push_int(f, obj->length); if (r) return r;
+            break;
+        }
+
+        /* ── stubs ── */
+        case OP_GETSTATIC: { r = fetch_i16(f, &(int16_t){0}); if(r) return r; break; }
+        case OP_INVOKEVIRTUAL:
+        case OP_INVOKESTATIC: { r = fetch_i16(f, &(int16_t){0}); if(r) return r; break; }
+        case OP_NEW: { r = fetch_i16(f, &(int16_t){0}); if(r) return r;
+                       r = push_ref(f, 0); if(r) return r; break; }
+
+        default:
+            fprintf(stderr, "[vm] unknown opcode 0x%02X at pc=%u\n",
+                    op, f->pc - 1);
+            return JVM_ERR_UNKNOWN_OPCODE;
+        }
+    }
 }
