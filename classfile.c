@@ -418,7 +418,7 @@ static CFResult extract_entry(const uint8_t *jar, uint32_t jar_len,
                               uint32_t compressed_size,
                               uint32_t uncompressed_size,
                               uint16_t method,
-                              uint8_t **out_data, uint32_t *out_len) // Added * to out_len
+                              uint8_t **out_data, uint32_t *out_len) 
 {
     if (local_offset + 30 > jar_len) return CF_ERR_TRUNCATED;
     const uint8_t *lhdr = jar + local_offset;
@@ -426,15 +426,18 @@ static CFResult extract_entry(const uint8_t *jar, uint32_t jar_len,
 
     uint16_t fname_len = zip_u16le(lhdr + 26);
     uint16_t extra_len = zip_u16le(lhdr + 28);
-    uint32_t data_off = local_offset + 30 + fname_len + extra_len;
     
-    if (data_off + compressed_size > jar_len) return CF_ERR_TRUNCATED;
+    /* ─── FIX: Use 64-bit math to prevent overflow wrap-around ─── */
+    uint64_t safe_off = (uint64_t)local_offset + 30 + fname_len + extra_len;
+    if (safe_off + compressed_size > jar_len) return CF_ERR_TRUNCATED;
+    
+    uint32_t data_off = (uint32_t)safe_off;
     
     if (method == 0) {
         *out_data = (uint8_t *)malloc(uncompressed_size);
         if (!*out_data) return CF_ERR_IO;
         memcpy(*out_data, jar + data_off, uncompressed_size);
-        *out_len = uncompressed_size; // Added * here
+        *out_len = uncompressed_size; 
         return CF_OK;
     }
     fprintf(stderr, "[jar] compression method %d not supported\n", method);
@@ -445,12 +448,24 @@ CFResult jar_load(const char *jar_path, ClassRegistry *reg) {
     /* read entire JAR into memory */
     FILE *fp = fopen(jar_path, "rb");
     if (!fp) return CF_ERR_IO;
+    
     fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp); rewind(fp);
+    long sz = ftell(fp);
+    if (sz < 0) { 
+        fclose(fp); 
+        return CF_ERR_IO; 
+    }
+    
+    rewind(fp);
+    
     uint8_t *jar = (uint8_t *)malloc((size_t)sz);
     if (!jar) { fclose(fp); return CF_ERR_IO; }
-    if ((long)fread(jar, 1, (size_t)sz, fp) != sz)
-        { free(jar); fclose(fp); return CF_ERR_IO; }
+    
+    if ((long)fread(jar, 1, (size_t)sz, fp) != sz) { 
+        free(jar); 
+        fclose(fp); 
+        return CF_ERR_IO; 
+    }
     fclose(fp);
 
     uint32_t jar_len = (uint32_t)sz;
