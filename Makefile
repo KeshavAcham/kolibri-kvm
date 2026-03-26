@@ -1,10 +1,8 @@
-CC      = gcc
-CFLAGS  = -Wall -Wextra -std=c99 -g
+CC     = gcc
+CFLAGS = -Wall -Wextra -std=c99 -g
 LDFLAGS = -lm
 
-# issue #11: -lm is required for fmodf, isnan from <math.h>
-
-.PHONY: all test clean
+.PHONY: all test kvm clean
 
 all: test
 
