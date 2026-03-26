@@ -318,6 +318,13 @@ CFResult classfile_load(const char *path, ClassFile **out) {
 
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
+    
+    /* ─── FIX: Check for ftell error before allocating ─── */
+    if (sz < 0) { 
+        fclose(fp); 
+        return CF_ERR_IO; 
+    }
+    
     rewind(fp);
 
     uint8_t *buf = (uint8_t *)malloc((size_t)sz);
