@@ -221,8 +221,8 @@ int main(void) {
     RUN_TEST("istore/iload local[10]", test_iload_istore, JVM_RETURN_INT, 55);
 
     printf("\n── Bug regressions ──\n");
-    RUN_TEST_ERR("bug1: bipush no operand",    bug1, JVM_ERR_OUT_OF_BOUNDS);
-    RUN_TEST_ERR("bug2: iadd empty stack",     bug2, JVM_ERR_STACK_UNDERFLOW);
+    RUN_TEST_ERR("bug1: bipush no operand", bug1, JVM_ERR_OUT_OF_BOUNDS); 
+    RUN_TEST_ERR("bug2: iadd empty stack", bug2, JVM_ERR_STACK_UNDERFLOW);
     RUN_TEST_ERR("bug3: goto negative target", bug3, JVM_ERR_OUT_OF_BOUNDS);
 
     printf("\n%d / %d tests passed\n", tests_passed, tests_run);
