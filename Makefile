@@ -1,18 +1,19 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c99 -g
+LDFLAGS = -lm
 
-# test runner (your original main.c)
-test: main.o jvm.o
-	$(CC) $(CFLAGS) -o $@ $^
+# issue #11: -lm is required for fmodf, isnan from <math.h>
 
-# class loader demo
-kvm: classloader_demo.o jvm.o classfile.o
-	$(CC) $(CFLAGS) -o $@ $^
+.PHONY: all test clean
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+all: test
+
+test: main.c jvm.c jvm.h
+	$(CC) $(CFLAGS) -o kvm_test main.c jvm.c $(LDFLAGS)
+	./kvm_test
+
+kvm: classloader_demo.c jvm.c jvm.h
+	$(CC) $(CFLAGS) -o kvm classloader_demo.c jvm.c $(LDFLAGS)
 
 clean:
-	rm -f *.o test kvm
-
-.PHONY: clean
+	rm -f kvm_test kvm *.o
