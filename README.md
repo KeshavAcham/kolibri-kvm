@@ -11,8 +11,7 @@ K Virtual Machine — KolibriOS J2ME Emulator
 ```
 
 > **Google Summer of Code 2026** — A bytecode interpreter, class file parser, JAR loader,
-> object model, and mark-and-sweep garbage collector — written entirely in C,
-> targeting [KolibriOS](http://kolibrios.org).
+> and object model — written entirely in C, targeting [KolibriOS](http://kolibrios.org).
 
 ---
 
@@ -39,11 +38,11 @@ manage a Java heap, and execute CLDC 1.1 bytecode — with zero external depende
 │  │  classfile.c │    │           jvm.c               │  │
 │  │              │    │                               │  │
 │  │ .class parser│───▶│  switch-dispatch loop         │  │
-│  │ CP resolver  │    │  107 CLDC 1.1 opcodes         │  │
+│  │ CP resolver  │    │  opcodes (CLDC 1.1 subset)    │  │
 │  │ JAR/ZIP loader│   │  operand stack                │  │
 │  │ class registry│   │  local variable array         │  │
 │  └──────────────┘    │  object heap                  │  │
-│                      │  mark-and-sweep GC            │  │
+│                      │  GC infrastructure (Phase 2)  │  │
 │  ┌──────────────┐    └───────────────────────────────┘  │
 │  │    jvm.h     │                                        │
 │  │              │    ┌───────────────────────────────┐  │
@@ -57,7 +56,7 @@ manage a Java heap, and execute CLDC 1.1 bytecode — with zero external depende
 | File | Purpose |
 | --- | --- |
 | `jvm.h` | All structs, opcode constants, result codes — the public API |
-| `jvm.c` | Interpreter loop, heap allocator, mark-and-sweep GC |
+| `jvm.c` | Interpreter loop, heap allocator |
 | `classfile.h` | ClassFile, MethodInfo, CPEntry, ClassRegistry types |
 | `classfile.c` | `.class` parser, constant pool resolver, JAR/ZIP loader |
 | `main.c` | 31-test suite covering every opcode category |
@@ -67,34 +66,34 @@ manage a Java heap, and execute CLDC 1.1 bytecode — with zero external depende
 
 ## Features
 
-### ✅ Bytecode Interpreter — 107 opcodes
+### ✅ Bytecode Interpreter — CLDC 1.1 subset
 
 | Category | Opcodes |
 | --- | --- |
-| Integer constants | `iconst_m1` … `iconst_5`, `bipush`, `sipush`, `ldc`, `ldc_w` |
+| Integer constants | `iconst_m1` … `iconst_5`, `bipush`, `sipush` |
 | Float constants | `fconst_0/1/2` |
-| Long constants | `lconst_0/1` |
 | Integer loads/stores | `iload/istore` 0–3 + indexed |
 | Reference loads/stores | `aload/astore` 0–3 + indexed, `aconst_null` |
-| Array loads | `iaload`, `aaload`, `baload`, `caload` |
-| Array stores | `iastore`, `aastore`, `bastore`, `castore` |
+| Array loads | `iaload` |
+| Array stores | `iastore` |
 | Integer arithmetic | `iadd`, `isub`, `imul`, `idiv`, `irem`, `ineg`, `iinc` |
 | Float arithmetic | `fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fneg` |
 | Bitwise / shift | `ishl`, `ishr`, `iushr`, `iand`, `ior`, `ixor` |
 | Float compare | `fcmpl`, `fcmpg` |
 | Type conversions | `i2f`, `f2i`, `i2b`, `i2c`, `i2s` |
-| Stack ops | `dup`, `dup_x1`, `dup_x2`, `dup2`, `pop`, `pop2`, `swap` |
+| Stack ops | `dup`, `dup_x1`, `pop`, `pop2`, `swap` |
 | Integer branches | `ifeq` … `ifle`, `if_icmpeq` … `if_icmple` |
-| Reference branches | `if_acmpeq`, `if_acmpne`, `ifnull`, `ifnonnull` |
-| Jumps | `goto`, `goto_w` |
+| Reference branches | `ifnull`, `ifnonnull` |
+| Jumps | `goto` |
 | Returns | `ireturn`, `freturn`, `areturn`, `return` |
-| Object creation | `new`, `newarray`, `anewarray` |
-| Field access | `getfield`, `putfield`, `getstatic`, `putstatic` |
-| Method invocation | `invokevirtual`, `invokespecial`, `invokestatic`, `invokeinterface` |
-| Type checks | `checkcast`, `instanceof`, `athrow` |
+| Object creation | `new`, `newarray` |
+| Field access | `getstatic` (stub) |
+| Method invocation | `invokevirtual` (stub), `invokestatic` (stub) |
 | Array length | `arraylength` |
-| Wide prefix | `wide iload/aload/istore/astore/iinc` |
-| Misc | `nop`, `lconst_0/1` |
+| Misc | `nop`, `aconst_null` |
+
+> Opcodes marked *stub* consume their operand bytes and are no-ops in Phase 1.
+> Full dispatch (`invoke*`, `getfield`, `putfield`, `athrow`, `wide`, `lconst`, `dup2`, `dup_x2`, `goto_w`, `if_acmpeq/ne`) is planned for Phase 2.
 
 ### ✅ Class File Parser
 
@@ -119,19 +118,17 @@ manage a Java heap, and execute CLDC 1.1 bytecode — with zero external depende
 
 ### ✅ Object Model & Heap
 
-* `JObject` supports plain objects, int arrays, ref arrays, and strings
+* `JObject` supports int arrays with a `marked` field ready for GC
 * Reference-based heap — objects addressed by 1-based integer refs (0 = null)
-* `vm_alloc_object`, `vm_alloc_array`, `vm_alloc_string` allocators
+* `vm_alloc_array_int` allocator with `MAX_OBJECTS` (512) capacity limit
 * Null pointer detection on every dereference
 * Array bounds checking on every load and store
 
-### ✅ Mark-and-Sweep Garbage Collector
+### 🔄 Garbage Collector — Phase 2
 
-* Roots scanned from all live frame operand stacks and local variable arrays
-* Recursive marking through object fields and reference array elements
-* Sweep phase frees all unmarked objects and reclaims their memory
-* Auto-triggered when object count exceeds `GC_THRESHOLD` (384/512 slots)
-* Zero external allocator dependencies — pure C `malloc`/`free`
+The `JObject` struct includes a `marked` field and `obj_count` tracking is in place.
+Full mark-and-sweep implementation (root scanning, recursive marking, sweep + `idata` free)
+is planned for Phase 2 alongside long arithmetic and `java.lang` native stubs.
 
 ### ✅ Robust Error Handling
 
@@ -154,12 +151,10 @@ Every single opcode is hardened against:
 ```
 # Build the test suite
 make test
-./test
 
-# Build the class loader
+# Build the class loader demo
 make kvm
-./kvm Hello.class
-./kvm app.jar com/example/Main
+./kvm
 ```
 
 ### Expected test output
@@ -180,56 +175,52 @@ make kvm
   [PASS] iinc: 5+3=8
   [PASS] branch: 7>5 → 1
   [PASS] loop: sum(1..5)=15
-  ...
+  [PASS] sipush 1000
+  [PASS] neg: -42
+  [PASS] 0xFF & 0x0F = 15
+  [PASS] 1 << 3 = 8
+  [PASS] dup: 5+5=10
 
 ── Float opcodes ──
   [PASS] fconst 1.0+2.0=3
+  [PASS] fconst 2.0*2.0=4
   [PASS] i2f→f2i round-trip 7
+
+── Reference / object ops ──
+  [PASS] aconst_null areturn
+  [PASS] astore/aload null
 
 ── Array ops ──
   [PASS] int[5] store/load[2]
   [PASS] int[7] arraylength
 
+── Type conversions ──
+  [PASS] i2b: 300→44
+  [PASS] i2s: 0x1170→4464
+
+── Stack ops ──
+  [PASS] dup_x1
+  [PASS] pop2
+
+── Null/ref branches ──
+  [PASS] ifnull taken
+
+── Wide locals ──
+  [PASS] istore/iload local[10]
+
 ── Bug regressions ──
   [PASS] bug1: bipush no operand  (→ ERR_OUT_OF_BOUNDS)
-  [PASS] bug2: iadd empty stack   (→ ERR_STACK_UNDERFLOW)
-  [PASS] bug3: goto negative target (→ ERR_OUT_OF_BOUNDS)
+  [PASS] bug2: iadd empty stack  (→ ERR_STACK_UNDERFLOW)
+  [PASS] bug3: goto negative target  (→ ERR_OUT_OF_BOUNDS)
 
 31 / 31 tests passed
 ```
 
----
-
-## Running a real `.class` file
+### classloader_demo output
 
 ```
-$ ./kvm Hello.class
-[kvm] Loading class file: Hello.class
-[kvm] Class: Hello  (1 methods)
-[kvm] Methods:
-  [0] run ()I
-[kvm] Running method: run()I
-  [pc=  0] opcode=0x05  sp=-1
-  [pc=  1] opcode=0x06  sp=0
-  [pc=  2] opcode=0x60  sp=1
-  [pc=  3] opcode=0xAC  sp=0
-[kvm] Result: RETURN_INT  return value = 5
+classloader_demo: sum(1..10) = 55  [RETURN_INT]
 ```
-
----
-
-## Bug Fixes (post-review)
-
-Following mentor code review, these correctness issues were resolved:
-
-| Bug | Fix |
-| --- | --- |
-| `ldc` pushed CP index instead of value | Now resolves `CP_INTEGER`, `CP_FLOAT`, `CP_STRING` from `CPEntry`; falls back to raw index if no CP attached |
-| `fdiv` returned `1e30f` instead of IEEE 754 Infinity | Removed magic constant — C `float` division produces `+Inf`/`-Inf`/`NaN` natively per IEEE 754 |
-| `fcmpl`/`fcmpg` returned 0 for NaN | Added `isnan()` check — `fcmpl` returns -1, `fcmpg` returns +1 per JVM spec |
-| `invokevirtual` always popped exactly 2 values | Now pops N args + object ref; `count_args()` helper parses method descriptor |
-| `athrow` returned `OUT_OF_BOUNDS` unconditionally | Now walks `exc_table`, finds handler covering throw PC, jumps to `handler_pc` |
-| `vm_alloc_array` leaked `idata`/`rdata` on exit | Added `obj_count` tracking; auto-GC triggers at `GC_THRESHOLD = 384` objects |
 
 ---
 
@@ -261,27 +252,27 @@ Following mentor code review, these correctness issues were resolved:
 | Bytecode interpreter (switch-dispatch) | ✅ Complete |
 | Operand stack with full error checking | ✅ Complete |
 | Local variable array (int, float, ref) | ✅ Complete |
-| 107 CLDC 1.1 opcodes | ✅ Complete |
+| CLDC 1.1 opcode subset | ✅ Complete |
 | `.class` file parser | ✅ Complete |
 | Constant pool resolution (all 12 tags) | ✅ Complete |
 | Method table + Code attribute | ✅ Complete |
 | Class registry | ✅ Complete |
 | JAR / ZIP loader | ✅ Complete |
 | Java heap + object model | ✅ Complete |
-| Mark-and-sweep GC | ✅ Complete |
-| Exception handler table dispatch (`athrow`) | ✅ Complete |
 | Comprehensive test suite (31 tests) | ✅ Complete |
+| Mark-and-sweep GC | 🔄 Phase 2 |
 | Real method dispatch (`invoke*`) | 🔄 Phase 2 |
 | `java.lang` native stubs | 🔄 Phase 2 |
 | Long arithmetic (`ladd`, `lmul` …) | 🔄 Phase 2 |
+| Remaining CLDC 1.1 opcodes | 🔄 Phase 2 |
 
 ---
 
 ## Roadmap
 
 ```
-Phase 1  ██████████████████░░  ~90%
-Phase 2  ░░░░░░░░░░░░░░░░░░░░  CLDC 1.1 libraries, GC, strings, exceptions
+Phase 1  ████████████████████  Complete
+Phase 2  ░░░░░░░░░░░░░░░░░░░░  GC, long arithmetic, full invoke*, java.lang stubs
 Phase 3  ░░░░░░░░░░░░░░░░░░░░  MIDP 2.0 Display/Canvas, MIDlet lifecycle
 Polish   ░░░░░░░░░░░░░░░░░░░░  Real J2ME app testing, docs, final submission
 ```
