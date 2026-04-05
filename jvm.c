@@ -8,7 +8,7 @@
  *      callee frame is pushed, result is returned to caller stack.
  *  #4  CP fully resolved for method refs, field refs, string literals.
  *  #8  Every stack/local access goes through bounds-checked helpers.
- *  #9  Mark-and-sweep GC scans all live frames.
+ *  #9  Mark-and-sweep GC scans all live frames. 
  *  #10 I/O abstraction via KVM_PRINT — swap for KolibriOS syscall.
  */
 
