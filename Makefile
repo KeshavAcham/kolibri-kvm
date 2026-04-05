@@ -1,17 +1,22 @@
-CC     = gcc
-CFLAGS = -Wall -Wextra -std=c99 -g
-LDFLAGS = -lm
+# kolibri-kvm — Makefile
+CC      = gcc
+CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -O2
+TARGET  = kvm
+SRCS    = main.c jvm.c classfile.c
+OBJS    = $(SRCS:.c=.o)
 
-.PHONY: all test kvm clean
+all: $(TARGET)
 
-all: test
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
 
-test: main.c jvm.c jvm.h          # tests only, no classloader
-	$(CC) $(CFLAGS) -o kvm_test main.c jvm.c $(LDFLAGS)
-	./kvm_test
-
-kvm: classloader_demo.c jvm.c classfile.c jvm.h classfile.h   # ADD classfile.c
-	$(CC) $(CFLAGS) -o kvm classloader_demo.c jvm.c classfile.c $(LDFLAGS)
+%.o: %.c jvm.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f kvm_test kvm *.o
+	rm -f $(OBJS) $(TARGET)
+
+test: $(TARGET)
+	./$(TARGET)
+
+.PHONY: all clean test
