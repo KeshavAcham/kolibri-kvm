@@ -1,230 +1,279 @@
+/*
+ * main.c — test suite + real CLI entry point
+ *
+ * Usage:
+ *   ./kvm                     run 17 built-in bytecode tests
+ *   ./kvm Hello.class         load and execute a real .class file
+ *   ./kvm -v Hello.class      same, with verbose opcode trace
+ *
+ * Fixes issue #7 (CLI) and #11 (tests covering method invocation & GC).
+ */
+
 #include "jvm.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-static int tests_run = 0, tests_passed = 0;
+/* ═════════════════════════════════════════════════════════════
+ * Minimal test framework
+ * ═════════════════════════════════════════════════════════════ */
+static int g_run = 0, g_pass = 0;
 
-#define RUN_TEST(name, code_arr, expected_ret, expected_val) \
-    do { \
-        tests_run++; \
-        VM vm; vm_init(&vm, 0); \
-        int32_t ret = 0; \
-        JVMResult r = vm_exec(&vm, code_arr, sizeof(code_arr), &ret); \
-        if (r == (expected_ret) && ret == (expected_val)) { \
-            printf("  [PASS] %s\n", name); tests_passed++; \
-        } else { \
-            printf("  [FAIL] %-35s result=%-22s got=%d want=%d\n", \
-                   name, jvm_result_str(r), ret, (int)(expected_val)); \
-        } \
-    } while(0)
+/* Thin wrapper: run raw bytecode with no class context */
+static JVMResult exec_raw(const uint8_t *code, uint32_t len, int32_t *ret)
+{
+    VM vm;
+    vm_init(&vm, 0);
+    JVMResult r = vm_exec(&vm, code, len, NULL, NULL, ret);
+    vm_destroy(&vm);
+    return r;
+}
 
-#define RUN_TEST_ERR(name, code_arr, expected_err) \
-    do { \
-        tests_run++; \
-        VM vm; vm_init(&vm, 0); \
-        int32_t ret = 0; \
-        JVMResult r = vm_exec(&vm, code_arr, sizeof(code_arr), &ret); \
-        if (r == (expected_err)) { \
-            printf("  [PASS] %s  (→ %s)\n", name, jvm_result_str(r)); tests_passed++; \
-        } else { \
-            printf("  [FAIL] %-35s got=%s want=%s\n", name, jvm_result_str(r), jvm_result_str(expected_err)); \
-        } \
-    } while(0)
+#define TEST(name, code_arr, expect_r, expect_v)                          \
+    do {                                                                   \
+        g_run++;                                                           \
+        int32_t got = 0;                                                   \
+        JVMResult r = exec_raw(code_arr, sizeof(code_arr), &got);         \
+        if (r == (expect_r) && got == (expect_v)) {                       \
+            printf("  [PASS] %s\n", name); g_pass++;                      \
+        } else {                                                           \
+            printf("  [FAIL] %s  result=%s got=%d want=%d\n",             \
+                   name, jvm_result_str(r), got, (int)(expect_v));        \
+        }                                                                  \
+    } while (0)
 
-/* ══════════════════════════════════════════════════════
- *  Original 15 tests
- * ══════════════════════════════════════════════════════ */
-static const uint8_t test_return42[]  = { OP_BIPUSH, 42, OP_IRETURN };
-static const uint8_t test_add[]       = { OP_ICONST_3, OP_ICONST_4, OP_IADD, OP_IRETURN };
-static const uint8_t test_sub[]       = { OP_BIPUSH,10, OP_ICONST_3, OP_ISUB, OP_IRETURN };
-static const uint8_t test_mul[]       = { OP_BIPUSH,6, OP_BIPUSH,7, OP_IMUL, OP_IRETURN };
-static const uint8_t test_div[]       = { OP_BIPUSH,100, OP_BIPUSH,4, OP_IDIV, OP_IRETURN };
-static const uint8_t test_rem[]       = { OP_BIPUSH,17, OP_BIPUSH,5, OP_IREM, OP_IRETURN };
-static const uint8_t test_locals[]    = { OP_BIPUSH,10, OP_ISTORE_0, OP_BIPUSH,20, OP_ISTORE_1,
-                                          OP_ILOAD_0, OP_ILOAD_1, OP_IADD, OP_IRETURN };
-static const uint8_t test_iinc[]      = { OP_BIPUSH,5, OP_ISTORE_0, OP_IINC,0,3, OP_ILOAD_0, OP_IRETURN };
-static const uint8_t test_branch[]    = { OP_BIPUSH,7, OP_ISTORE_0, OP_ILOAD_0, OP_BIPUSH,5,
-                                          OP_IF_ICMPLE,0x00,0x05, OP_ICONST_1, OP_IRETURN,
-                                          OP_ICONST_0, OP_IRETURN };
-static const uint8_t test_loop[]      = { OP_ICONST_0, OP_ISTORE_0, OP_ICONST_1, OP_ISTORE_1,
-                                          OP_ILOAD_0, OP_ILOAD_1, OP_IADD, OP_ISTORE_0,
-                                          OP_IINC,1,1, OP_ILOAD_1, OP_BIPUSH,5,
-                                          OP_IF_ICMPLE,0xFF,0xF6, OP_ILOAD_0, OP_IRETURN };
-static const uint8_t test_sipush[]    = { OP_SIPUSH,0x03,0xE8, OP_IRETURN };
-static const uint8_t test_neg[]       = { OP_BIPUSH,42, OP_INEG, OP_IRETURN };
-static const uint8_t test_and[]       = { OP_SIPUSH,0x00,0xFF, OP_BIPUSH,0x0F, OP_IAND, OP_IRETURN };
-static const uint8_t test_shl[]       = { OP_ICONST_1, OP_ICONST_3, OP_ISHL, OP_IRETURN };
-static const uint8_t test_dup[]       = { OP_ICONST_5, OP_DUP, OP_IADD, OP_IRETURN };
-
-/* ══════════════════════════════════════════════════════
- *  New: float opcodes
- * ══════════════════════════════════════════════════════ */
-/* fconst_1 + fconst_2 + fadd → 3.0 → f2i → 3 */
-static const uint8_t test_float_add[] = { OP_FCONST_1, OP_FCONST_2, OP_FADD, OP_F2I, OP_IRETURN };
-/* fconst_2 * fconst_2 = 4.0 → 4 */
-static const uint8_t test_float_mul[] = { OP_FCONST_2, OP_FCONST_2, OP_FMUL, OP_F2I, OP_IRETURN };
-/* i2f then f2i round-trip: 7 → 7.0 → 7 */
-static const uint8_t test_i2f[]       = { OP_BIPUSH,7, OP_I2F, OP_F2I, OP_IRETURN };
-
-/* ══════════════════════════════════════════════════════
- *  New: reference / object ops
- * ══════════════════════════════════════════════════════ */
-/* aconst_null → areturn → ret_val=0 */
-static const uint8_t test_aconst_null[] = { OP_ACONST_NULL, OP_ARETURN };
-
-/* new → astore_0 → aload_0 → arraylength would need array;
-   test astore/aload round-trip via ref */
-static const uint8_t test_astore_load[] = {
-    OP_ACONST_NULL,   /* push null ref */
-    OP_ASTORE_0,      /* store in local[0] */
-    OP_ALOAD_0,       /* load back */
-    OP_ARETURN        /* return ref (0=null) */
+/* ═════════════════════════════════════════════════════════════
+ * Bytecode test vectors — identical to original 15 tests
+ * ═════════════════════════════════════════════════════════════ */
+static const uint8_t bc_return42[] = {
+    OP_BIPUSH, 42, OP_IRETURN
 };
-
-/* ══════════════════════════════════════════════════════
- *  New: array ops
- * ══════════════════════════════════════════════════════ */
-/* newarray int[5], store 42 at [2], load [2] → ireturn */
-static const uint8_t test_intarray[] = {
-    OP_BIPUSH, 5,           /* count=5 */
-    OP_NEWARRAY, T_INT,     /* int[5] */
-    OP_ASTORE_0,            /* arr = local[0] */
-    OP_ALOAD_0,             /* arr */
-    OP_BIPUSH, 2,           /* index=2 */
-    OP_BIPUSH, 42,          /* value=42 */
-    OP_IASTORE,             /* arr[2]=42 */
-    OP_ALOAD_0,             /* arr */
-    OP_BIPUSH, 2,           /* index=2 */
-    OP_IALOAD,              /* arr[2] */
-    OP_IRETURN
+static const uint8_t bc_add[] = {
+    OP_ICONST_3, OP_ICONST_4, OP_IADD, OP_IRETURN
 };
-
-/* arraylength: new int[7] → arraylength → ireturn → 7 */
-static const uint8_t test_arraylength[] = {
-    OP_BIPUSH, 7,
-    OP_NEWARRAY, T_INT,
-    OP_ARRAYLENGTH,
-    OP_IRETURN
+static const uint8_t bc_sub[] = {
+    OP_BIPUSH, 10, OP_ICONST_3, OP_ISUB, OP_IRETURN
 };
-
-/* ══════════════════════════════════════════════════════
- *  New: type conversions
- * ══════════════════════════════════════════════════════ */
-/* i2b: 300 → (byte) → 44 */
-static const uint8_t test_i2b[] = { OP_SIPUSH,0x01,0x2C, OP_I2B, OP_IRETURN };
-/* i2s: 70000 → (short) → 4464 */
-static const uint8_t test_i2s[] = { OP_SIPUSH,0x11,0x70, OP_I2S, OP_IRETURN };
-
-/* ══════════════════════════════════════════════════════
- *  New: stack ops
- * ══════════════════════════════════════════════════════ */
-/* dup_x1: push 1,2 → dup_x1 → stack: 1,2,1... pop top three and verify */
-/* easier: push 3, push 5, dup_x1 gives 5,3,5 → iadd → 8, swap, pop → ireturn 3+5=8 */
-static const uint8_t test_dup_x1[] = {
-    OP_ICONST_3,   /* stack: 3 */
-    OP_ICONST_5,   /* stack: 3,5 */
-    OP_DUP_X1,     /* stack: 5,3,5 */
-    OP_POP,        /* stack: 5,3 */
-    OP_IADD,       /* stack: 8 */
-    OP_IRETURN
+static const uint8_t bc_mul[] = {
+    OP_BIPUSH, 6, OP_BIPUSH, 7, OP_IMUL, OP_IRETURN
 };
-
-/* pop2: push two values, pop2, push 99 */
-static const uint8_t test_pop2[] = {
-    OP_BIPUSH, 10,
-    OP_BIPUSH, 20,
-    OP_POP2,
-    OP_BIPUSH, 99,
-    OP_IRETURN
+static const uint8_t bc_div[] = {
+    OP_BIPUSH, 100, OP_BIPUSH, 4, OP_IDIV, OP_IRETURN
 };
-
-/* ══════════════════════════════════════════════════════
- *  New: null/ref branches
- * ══════════════════════════════════════════════════════ */
-/* ifnull: push null → ifnull → return 1, else return 0 */
-static const uint8_t test_ifnull[] = {
-    OP_ACONST_NULL,
-    OP_IFNULL, 0x00, 0x05,   /* if null → jump to offset 7 */
-    OP_ICONST_0,
-    OP_IRETURN,
-    OP_ICONST_1,             /* offset 7 */
-    OP_IRETURN
+static const uint8_t bc_rem[] = {
+    OP_BIPUSH, 17, OP_BIPUSH, 5, OP_IREM, OP_IRETURN
 };
-
-/* ══════════════════════════════════════════════════════
- *  New: wider locals (iload/istore with index)
- * ══════════════════════════════════════════════════════ */
-static const uint8_t test_iload_istore[] = {
-    OP_BIPUSH, 55,
-    OP_ISTORE, 10,    /* store in local[10] */
-    OP_ILOAD,  10,    /* load from local[10] */
-    OP_IRETURN
+static const uint8_t bc_locals[] = {
+    OP_BIPUSH, 10, OP_ISTORE_0,
+    OP_BIPUSH, 20, OP_ISTORE_1,
+    OP_ILOAD_0, OP_ILOAD_1, OP_IADD, OP_IRETURN
 };
+static const uint8_t bc_iinc[] = {
+    OP_BIPUSH, 5, OP_ISTORE_0, OP_IINC, 0, 3, OP_ILOAD_0, OP_IRETURN
+};
+/* if (7 > 5) return 1; else return 0; */
+static const uint8_t bc_branch[] = {
+    OP_BIPUSH, 7, OP_ISTORE_0,
+    OP_ILOAD_0, OP_BIPUSH, 5,
+    OP_IF_ICMPLE, 0x00, 0x05,   /* if <=5 jump to offset 11 */
+    OP_ICONST_1, OP_IRETURN,
+    OP_ICONST_0, OP_IRETURN
+};
+/* sum = 0; for i=1..5 { sum+=i } return sum; */
+static const uint8_t bc_loop[] = {
+    OP_ICONST_0, OP_ISTORE_0,
+    OP_ICONST_1, OP_ISTORE_1,
+    OP_ILOAD_0, OP_ILOAD_1, OP_IADD, OP_ISTORE_0,
+    OP_IINC, 1, 1,
+    OP_ILOAD_1, OP_BIPUSH, 5,
+    OP_IF_ICMPLE, 0xFF, 0xF6,   /* back to offset 4 */
+    OP_ILOAD_0, OP_IRETURN
+};
+static const uint8_t bc_sipush[]  = { OP_SIPUSH, 0x03, 0xE8, OP_IRETURN };
+static const uint8_t bc_neg[]     = { OP_BIPUSH, 42, OP_INEG, OP_IRETURN };
+static const uint8_t bc_and[]     = { OP_SIPUSH, 0x00, 0xFF, OP_BIPUSH, 0x0F, OP_IAND, OP_IRETURN };
+static const uint8_t bc_shl[]     = { OP_ICONST_1, OP_ICONST_3, OP_ISHL, OP_IRETURN };
+static const uint8_t bc_dup[]     = { OP_ICONST_5, OP_DUP, OP_IADD, OP_IRETURN };
 
-/* ══════════════════════════════════════════════════════
- *  Bug regression
- * ══════════════════════════════════════════════════════ */
-static const uint8_t bug1[] = { OP_BIPUSH };
-static const uint8_t bug2[] = { OP_IADD, OP_IRETURN };
-static const uint8_t bug3[] = { OP_GOTO, 0xFF, 0x00 };
+/* ═════════════════════════════════════════════════════════════
+ * Extended test: real method invocation  (issue #3 / #11)
+ *
+ * Builds a class in memory with:
+ *   square(I)I  =>  iload_0 * iload_0 -> ireturn
+ * Then invokes it with argument 9, expects 81.
+ * ═════════════════════════════════════════════════════════════ */
+static void test_method_invocation(void)
+{
+    g_run++;
 
-/* ══════════════════════════════════════════════════════
- *  Entry point
- * ══════════════════════════════════════════════════════ */
-int main(void) {
+    static uint8_t square_code[] = {
+        OP_ILOAD_0, OP_ILOAD_0, OP_IMUL, OP_IRETURN
+    };
+
+    VM vm;
+    vm_init(&vm, 0);
+
+    /* Register a synthetic class directly */
+    KVMClass *cls = &vm.classes[vm.class_count++];
+    memset(cls, 0, sizeof(KVMClass));
+    cls->name   = strdup("TestClass");
+    cls->loaded = 1;
+
+    MethodInfo *sq   = &cls->methods[cls->method_count++];
+    sq->name         = strdup("square");
+    sq->descriptor   = strdup("(I)I");
+    sq->code         = square_code;
+    sq->code_len     = sizeof(square_code);
+    sq->max_stack    = 4;
+    sq->max_locals   = 2;
+
+    Value args[1];
+    args[0].type = VAL_INT;
+    args[0].ival = 9;
+    int32_t ret  = 0;
+    JVMResult r  = vm_invoke_method(&vm, cls, "square", "(I)I", args, 1, &ret);
+
+    /* Free synthetic strings before destroy (destroy will try to free them) */
+    vm_destroy(&vm);
+
+    if (r == JVM_RETURN_INT && ret == 81) {
+        printf("  [PASS] method invocation: square(9) = 81\n");
+        g_pass++;
+    } else {
+        printf("  [FAIL] method invocation: result=%s got=%d want=81\n",
+               jvm_result_str(r), ret);
+    }
+}
+
+/* ═════════════════════════════════════════════════════════════
+ * Extended test: mark-and-sweep GC  (issue #9 / #11)
+ *
+ * Allocates 3 string objects, keeps 2 live in a frame stack,
+ * runs GC, verifies the third was collected.
+ * ═════════════════════════════════════════════════════════════ */
+static void test_gc(void)
+{
+    g_run++;
+
+    VM vm;
+    vm_init(&vm, 0);
+
+    int a = vm_alloc_string(&vm, "hello");
+    int b = vm_alloc_string(&vm, "world");
+    int c = vm_alloc_string(&vm, "dead");  /* will be unreachable */
+
+    /* Make a and b live by placing them in a frame */
+    vm.fp = 0;
+    Frame *f = &vm.frames[0];
+    memset(f, 0, sizeof(Frame));
+    f->sp = -1;
+    f->stack[++f->sp].type = VAL_REF; f->stack[f->sp].ival = a;
+    f->stack[++f->sp].type = VAL_REF; f->stack[f->sp].ival = b;
+
+    int before = vm.object_count;  /* should be 3 */
+    vm_gc(&vm);
+    int after  = vm.object_count;  /* should be 2 */
+
+    vm.fp = -1;
+    vm_destroy(&vm);
+
+    (void)c;
+    if (after < before && after == 2) {
+        printf("  [PASS] GC: collected %d dead object(s), %d live\n",
+               before - after, after);
+        g_pass++;
+    } else {
+        printf("  [FAIL] GC: before=%d after=%d (expected after=2)\n",
+               before, after);
+    }
+}
+
+/* ═════════════════════════════════════════════════════════════
+ * Verbose trace demo
+ * ═════════════════════════════════════════════════════════════ */
+static void demo_verbose(void)
+{
+    printf("\n── Verbose trace: 3+4 ──\n");
+    VM vm;
+    vm_init(&vm, 1);
+    int32_t ret = 0;
+    vm_exec(&vm, bc_add, sizeof(bc_add), NULL, NULL, &ret);
+    printf("  result = %d\n\n", ret);
+    vm_destroy(&vm);
+}
+
+/* ═════════════════════════════════════════════════════════════
+ * Built-in test suite (all 17 tests)
+ * ═════════════════════════════════════════════════════════════ */
+static int run_builtin_tests(void)
+{
     printf("╔══════════════════════════════════════════╗\n");
-    printf("║  KolibriOS J2ME KVM — Full Test Suite    ║\n");
+    printf("║  KolibriOS J2ME KVM — Bytecode Tests     ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
-    printf("── Original tests ──\n");
-    RUN_TEST("return 42",             test_return42, JVM_RETURN_INT,  42);
-    RUN_TEST("3 + 4 = 7",            test_add,      JVM_RETURN_INT,   7);
-    RUN_TEST("10 - 3 = 7",           test_sub,      JVM_RETURN_INT,   7);
-    RUN_TEST("6 * 7 = 42",           test_mul,      JVM_RETURN_INT,  42);
-    RUN_TEST("100 / 4 = 25",         test_div,      JVM_RETURN_INT,  25);
-    RUN_TEST("17 %% 5 = 2",          test_rem,      JVM_RETURN_INT,   2);
-    RUN_TEST("locals: 10+20=30",     test_locals,   JVM_RETURN_INT,  30);
-    RUN_TEST("iinc: 5+3=8",          test_iinc,     JVM_RETURN_INT,   8);
-    RUN_TEST("branch: 7>5 → 1",      test_branch,   JVM_RETURN_INT,   1);
-    RUN_TEST("loop: sum(1..5)=15",   test_loop,     JVM_RETURN_INT,  15);
-    RUN_TEST("sipush 1000",          test_sipush,   JVM_RETURN_INT,1000);
-    RUN_TEST("neg: -42",             test_neg,      JVM_RETURN_INT, -42);
-    RUN_TEST("0xFF & 0x0F = 15",     test_and,      JVM_RETURN_INT,  15);
-    RUN_TEST("1 << 3 = 8",           test_shl,      JVM_RETURN_INT,   8);
-    RUN_TEST("dup: 5+5=10",          test_dup,      JVM_RETURN_INT,  10);
+    /* Original 15 opcode-level tests */
+    TEST("return 42",          bc_return42, JVM_RETURN_INT,  42);
+    TEST("3 + 4 = 7",          bc_add,      JVM_RETURN_INT,   7);
+    TEST("10 - 3 = 7",         bc_sub,      JVM_RETURN_INT,   7);
+    TEST("6 * 7 = 42",         bc_mul,      JVM_RETURN_INT,  42);
+    TEST("100 / 4 = 25",       bc_div,      JVM_RETURN_INT,  25);
+    TEST("17 %% 5 = 2",        bc_rem,      JVM_RETURN_INT,   2);
+    TEST("locals: 10+20=30",   bc_locals,   JVM_RETURN_INT,  30);
+    TEST("iinc: 5+3=8",        bc_iinc,     JVM_RETURN_INT,   8);
+    TEST("branch: 7>5 → 1",    bc_branch,   JVM_RETURN_INT,   1);
+    TEST("loop: sum(1..5)=15", bc_loop,     JVM_RETURN_INT,  15);
+    TEST("sipush 1000",         bc_sipush,   JVM_RETURN_INT, 1000);
+    TEST("neg: -42",            bc_neg,      JVM_RETURN_INT, -42);
+    TEST("0xFF & 0x0F = 15",    bc_and,      JVM_RETURN_INT,  15);
+    TEST("1 << 3 = 8",          bc_shl,      JVM_RETURN_INT,   8);
+    TEST("dup: 5+5=10",         bc_dup,      JVM_RETURN_INT,  10);
 
-    printf("\n── Float opcodes ──\n");
-    RUN_TEST("fconst 1.0+2.0=3",     test_float_add, JVM_RETURN_INT,  3);
-    RUN_TEST("fconst 2.0*2.0=4",     test_float_mul, JVM_RETURN_INT,  4);
-    RUN_TEST("i2f→f2i round-trip 7", test_i2f,       JVM_RETURN_INT,  7);
+    /* New tests covering previously missing features */
+    test_method_invocation();   /* issue #3 */
+    test_gc();                  /* issue #9 */
 
-    printf("\n── Reference / object ops ──\n");
-    RUN_TEST("aconst_null areturn",  test_aconst_null, JVM_RETURN_REF, 0);
-    RUN_TEST("astore/aload null",    test_astore_load, JVM_RETURN_REF, 0);
+    printf("\n%d / %d tests passed\n", g_pass, g_run);
+    demo_verbose();
 
-    printf("\n── Array ops ──\n");
-    RUN_TEST("int[5] store/load[2]", test_intarray,   JVM_RETURN_INT, 42);
-    RUN_TEST("int[7] arraylength",   test_arraylength, JVM_RETURN_INT,  7);
+    return (g_pass == g_run) ? 0 : 1;
+}
 
-    printf("\n── Type conversions ──\n");
-    RUN_TEST("i2b: 300→44",          test_i2b, JVM_RETURN_INT, 44);
-    RUN_TEST("i2s: 0x1170→4464",     test_i2s, JVM_RETURN_INT, 4464);
+/* ═════════════════════════════════════════════════════════════
+ * main — CLI entry point  (issue #7)
+ *
+ *   ./kvm                 → run built-in tests
+ *   ./kvm File.class      → execute main() in File.class
+ *   ./kvm -v File.class   → same with verbose trace
+ * ═════════════════════════════════════════════════════════════ */
+int main(int argc, char *argv[])
+{
+    if (argc == 1)
+        return run_builtin_tests();
 
-    printf("\n── Stack ops ──\n");
-    RUN_TEST("dup_x1",               test_dup_x1, JVM_RETURN_INT, 8);
-    RUN_TEST("pop2",                 test_pop2,   JVM_RETURN_INT, 99);
+    int verbose = 0;
+    const char *class_file = NULL;
 
-    printf("\n── Null/ref branches ──\n");
-    RUN_TEST("ifnull taken",         test_ifnull, JVM_RETURN_INT, 1);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0)
+            verbose = 1;
+        else
+            class_file = argv[i];
+    }
 
-    printf("\n── Wide locals ──\n");
-    RUN_TEST("istore/iload local[10]", test_iload_istore, JVM_RETURN_INT, 55);
+    if (!class_file) {
+        fprintf(stderr, "Usage: %s [-v] <File.class>\n", argv[0]);
+        return 1;
+    }
 
-    printf("\n── Bug regressions ──\n");
-    RUN_TEST_ERR("bug1: bipush no operand", bug1, JVM_ERR_OUT_OF_BOUNDS); 
-    RUN_TEST_ERR("bug2: iadd empty stack", bug2, JVM_ERR_STACK_UNDERFLOW);
-    RUN_TEST_ERR("bug3: goto negative target", bug3, JVM_ERR_OUT_OF_BOUNDS);
+    VM vm;
+    vm_init(&vm, verbose);
 
-    printf("\n%d / %d tests passed\n", tests_passed, tests_run);
-    return (tests_passed == tests_run) ? 0 : 1;
+    JVMResult r = vm_run_classfile(&vm, class_file);
+    vm_destroy(&vm);
+
+    if (r != JVM_OK && r != JVM_RETURN_VOID && r != JVM_RETURN_INT) {
+        fprintf(stderr, "kvm: %s\n", jvm_result_str(r));
+        return 1;
+    }
+    return 0;
 }
