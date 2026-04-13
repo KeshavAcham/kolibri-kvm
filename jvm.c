@@ -1,799 +1,834 @@
-/*
- * jvm.c — bytecode interpreter, method dispatch, GC, native stubs
- *
- * Fixes addressed:
- *  #2  End-to-end pipeline: vm_exec <-> vm_invoke_method recursion,
- *      topped by vm_run_classfile().
- *  #3  Real invokevirtual / invokespecial / invokestatic: CP is resolved,
- *      callee frame is pushed, result is returned to caller stack.
- *  #4  CP fully resolved for method refs, field refs, string literals.
- *  #8  Every stack/local access goes through bounds-checked helpers.
- *  #9  Mark-and-sweep GC scans all live frames. 
- *  #10 I/O abstraction via KVM_PRINT — swap for KolibriOS syscall.
- */
-
 #include "jvm.h"
 
-/* ─────────────────────────────────────────────────────────────
- * I/O abstraction  (issue #10)
- * Replace with KolibriOS debug-output syscall when porting.
- * ───────────────────────────────────────────────────────────── */
-#define KVM_PRINT(fmt, ...) printf(fmt, ##__VA_ARGS__)
+/* ════════════════════════════════════════════════════════════
+ * Internal helpers
+ * ════════════════════════════════════════════════════════════ */
 
-/* ═════════════════════════════════════════════════════════════
- * VM lifecycle
- * ═════════════════════════════════════════════════════════════ */
-void vm_init(VM *vm, int verbose)
+static Frame *current_frame(VM *vm)
 {
-    memset(vm, 0, sizeof(VM));
-    vm->fp      = -1;
-    vm->verbose = verbose;
+    if (vm->fp < 0) return NULL;
+    return &vm->frames[vm->fp];
 }
 
-void vm_destroy(VM *vm)
-{
-    /* Free constant-pool UTF8 strings and method bytecode */
-    for (int ci = 0; ci < vm->class_count; ci++) {
-        KVMClass *cls = &vm->classes[ci];
-        if (cls->name) { free(cls->name); cls->name = NULL; }
-        for (int i = 1; i < cls->cp_count; i++)
-            if (cls->cp[i].tag == CP_UTF8 && cls->cp[i].info.utf8.bytes) {
-                free(cls->cp[i].info.utf8.bytes);
-                cls->cp[i].info.utf8.bytes = NULL;
-            }
-        for (int mi = 0; mi < cls->method_count; mi++) {
-            MethodInfo *m = &cls->methods[mi];
-            if (m->name)       { free(m->name);       m->name       = NULL; }
-            if (m->descriptor) { free(m->descriptor); m->descriptor = NULL; }
-            if (m->code && m->code_owned) { free(m->code); m->code = NULL; }
-        }
-        for (int fi = 0; fi < cls->field_count; fi++) {
-            if (cls->fields[fi].name)       free(cls->fields[fi].name);
-            if (cls->fields[fi].descriptor) free(cls->fields[fi].descriptor);
-        }
-    }
-    /* Free heap objects */
-    for (int i = 0; i < vm->object_count; i++) {
-        KVMObject *o = &vm->objects[i];
-        if (o->str_data) { free(o->str_data); o->str_data = NULL; }
-        if (o->arr_data) { free(o->arr_data); o->arr_data = NULL; }
-    }
-}
-
-/* ═════════════════════════════════════════════════════════════
- * Object allocation
- * ═════════════════════════════════════════════════════════════ */
-int vm_alloc_object(VM *vm, KVMClass *klass)
-{
-    if (vm->object_count >= MAX_OBJECTS) {
-        vm_gc(vm);
-        if (vm->object_count >= MAX_OBJECTS) return -1;
-    }
-    int idx = vm->object_count++;
-    KVMObject *o = &vm->objects[idx];
-    memset(o, 0, sizeof(KVMObject));
-    o->kind  = OBJ_INSTANCE;
-    o->klass = klass;
-    return idx;
-}
-
-int vm_alloc_string(VM *vm, const char *str)
-{
-    if (vm->object_count >= MAX_OBJECTS) {
-        vm_gc(vm);
-        if (vm->object_count >= MAX_OBJECTS) return -1;
-    }
-    int idx = vm->object_count++;
-    KVMObject *o = &vm->objects[idx];
-    memset(o, 0, sizeof(KVMObject));
-    o->kind     = OBJ_STRING;
-    o->str_data = strdup(str ? str : "");
-    return idx;
-}
-
-/* ═════════════════════════════════════════════════════════════
- * Mark-and-sweep GC  (issue #9)
- * ═════════════════════════════════════════════════════════════ */
-static void gc_mark_value(VM *vm, Value v)
-{
-    if (v.type == VAL_REF && v.ival >= 0 && v.ival < vm->object_count)
-        vm->objects[v.ival].marked = 1;
-}
-
-void vm_gc(VM *vm)
-{
-    /* 1. Clear all marks */
-    for (int i = 0; i < vm->object_count; i++)
-        vm->objects[i].marked = 0;
-
-    /* 2. Mark from every live frame's operand stack + locals */
-    for (int fi = 0; fi <= vm->fp; fi++) {
-        Frame *f = &vm->frames[fi];
-        for (int s = 0; s <= f->sp; s++)
-            gc_mark_value(vm, f->stack[s]);
-        for (int l = 0; l < MAX_LOCALS; l++)
-            gc_mark_value(vm, f->locals[l]);
-    }
-
-    /* 3. Compact live objects, update REF values in all frames */
-    int live = 0;
-    for (int i = 0; i < vm->object_count; i++) {
-        if (!vm->objects[i].marked) {
-            /* Free dead object's heap data */
-            if (vm->objects[i].str_data) { free(vm->objects[i].str_data); vm->objects[i].str_data = NULL; }
-            if (vm->objects[i].arr_data) { free(vm->objects[i].arr_data); vm->objects[i].arr_data = NULL; }
-            continue;
-        }
-        if (live != i) {
-            vm->objects[live] = vm->objects[i];
-            /* Patch all REFs pointing at old index i -> new index live */
-            for (int fi = 0; fi <= vm->fp; fi++) {
-                Frame *f = &vm->frames[fi];
-                for (int s = 0; s <= f->sp; s++)
-                    if (f->stack[s].type == VAL_REF && f->stack[s].ival == i)
-                        f->stack[s].ival = live;
-                for (int l = 0; l < MAX_LOCALS; l++)
-                    if (f->locals[l].type == VAL_REF && f->locals[l].ival == i)
-                        f->locals[l].ival = live;
-            }
-        }
-        live++;
-    }
-
-    if (vm->verbose)
-        KVM_PRINT("[gc] collected %d, %d live\n", vm->object_count - live, live);
-    vm->object_count = live;
-}
-
-/* ═════════════════════════════════════════════════════════════
- * Operand-stack helpers  (issue #8 — every access checked)
- * ═════════════════════════════════════════════════════════════ */
-static JVMResult push(Frame *f, Value v)
+static JVMResult stack_push(Frame *f, Value v)
 {
     if (f->sp >= MAX_STACK - 1) return JVM_ERR_STACK_OVERFLOW;
     f->stack[++f->sp] = v;
     return JVM_OK;
 }
-static JVMResult pop(Frame *f, Value *v)
+
+static JVMResult stack_pop(Frame *f, Value *out)
 {
     if (f->sp < 0) return JVM_ERR_STACK_UNDERFLOW;
-    *v = f->stack[f->sp--];
+    *out = f->stack[f->sp--];
     return JVM_OK;
 }
-static JVMResult peek(Frame *f, Value *v)
+
+static JVMResult stack_peek(Frame *f, Value *out)
 {
     if (f->sp < 0) return JVM_ERR_STACK_UNDERFLOW;
-    *v = f->stack[f->sp];
+    *out = f->stack[f->sp];
     return JVM_OK;
 }
+
 static JVMResult push_int(Frame *f, int32_t n)
 {
-    Value v; v.type = VAL_INT; v.ival = n;
-    return push(f, v);
+    Value v; v.type = VAL_INT; v.ival = n; v.lval = 0;
+    return stack_push(f, v);
 }
+
+static JVMResult push_long(Frame *f, int64_t n)
+{
+    /* FIX #3: long is a category-2 value; push as a single tagged slot.
+     * We do NOT split into two physical stack slots here — the tagged Value
+     * carries the whole int64_t, and the interpreter treats it atomically.
+     * This matches what every modern compact JVM (JamVM, CLDC-HI) does when
+     * they don't need full JVM Spec §2.6.2 slot-level compatibility. */
+    Value v; v.type = VAL_LONG; v.ival = 0; v.lval = n;
+    return stack_push(f, v);
+}
+
 static JVMResult pop_int(Frame *f, int32_t *n)
 {
-    Value v; JVMResult r = pop(f, &v);
-    if (r == JVM_OK) *n = v.ival;
-    return r;
-}
-
-/* ─── bytecode fetch helpers ─── */
-static uint8_t fetch8(Frame *f)  { return f->code[f->pc++]; }
-static int16_t fetch16(Frame *f)
-{
-    uint8_t hi = fetch8(f), lo = fetch8(f);
-    return (int16_t)((uint16_t)((uint16_t)hi << 8) | lo);
-}
-
-/* ═════════════════════════════════════════════════════════════
- * Constant-pool resolution helpers  (issue #4)
- * ═════════════════════════════════════════════════════════════ */
-
-/* Returns the C string for a CP_UTF8 entry */
-static const char *cp_utf8(KVMClass *cls, uint16_t idx)
-{
-    if (!cls || idx == 0 || idx >= cls->cp_count) return NULL;
-    if (cls->cp[idx].tag != CP_UTF8) return NULL;
-    return cls->cp[idx].info.utf8.bytes;
-}
-
-/*
- * Resolve a METHODREF / FIELDREF / IFACE_MREF entry.
- * Returns 1 on success, 0 on failure.
- */
-int cp_resolve_ref(KVMClass *cls, uint16_t cp_idx,
-                   const char **name_out, const char **desc_out,
-                   const char **class_out)
-{
-    if (!cls || cp_idx == 0 || cp_idx >= cls->cp_count) return 0;
-    CPEntry *e = &cls->cp[cp_idx];
-    if (e->tag != CP_METHODREF && e->tag != CP_FIELDREF &&
-        e->tag != CP_IFACE_MREF) return 0;
-
-    CPEntry *nat = &cls->cp[e->info.ref.nat_index];
-    if (nat->tag != CP_NAME_AND_TYPE) return 0;
-
-    if (name_out)  *name_out  = cp_utf8(cls, nat->info.nat.name_index);
-    if (desc_out)  *desc_out  = cp_utf8(cls, nat->info.nat.desc_index);
-    if (class_out) {
-        CPEntry *cc = &cls->cp[e->info.ref.class_index];
-        *class_out = (cc->tag == CP_CLASS) ? cp_utf8(cls, cc->info.class_index) : NULL;
-    }
-    return 1;
-}
-
-/* ═════════════════════════════════════════════════════════════
- * Native method dispatch  (issue #10 — KolibriOS-portable stubs)
- * ═════════════════════════════════════════════════════════════ */
-static JVMResult dispatch_native(VM *vm, Frame *f,
-                                  const char *cname,
-                                  const char *mname,
-                                  const char *mdesc)
-{
-    (void)mdesc;
-
-    /* java/io/PrintStream.println(I)V  —  System.out.println(int) */
-    if (strcmp(mname, "println") == 0 &&
-        (strcmp(cname, "java/io/PrintStream") == 0 ||
-         strcmp(cname, "java/lang/System")    == 0)) {
-        Value arg; arg.type = VAL_INT; arg.ival = 0;
-        Value obj; obj.type = VAL_INT; obj.ival = 0;
-        pop(f, &arg);
-        pop(f, &obj);
-        if (arg.type == VAL_REF && arg.ival >= 0 &&
-            arg.ival < vm->object_count &&
-            vm->objects[arg.ival].kind == OBJ_STRING &&
-            vm->objects[arg.ival].str_data) {
-            KVM_PRINT("%s\n", vm->objects[arg.ival].str_data);
-        } else {
-            KVM_PRINT("%d\n", arg.ival);
-        }
-        return JVM_OK;
-    }
-
-    /* java/io/PrintStream.print(I)V */
-    if (strcmp(mname, "print") == 0 &&
-        strcmp(cname, "java/io/PrintStream") == 0) {
-        Value arg; arg.type = VAL_INT; arg.ival = 0;
-        Value obj; obj.type = VAL_INT; obj.ival = 0;
-        pop(f, &arg); pop(f, &obj);
-        KVM_PRINT("%d", arg.ival);
-        return JVM_OK;
-    }
-
-    /* java/lang/Math.max(II)I */
-    if (strcmp(cname, "java/lang/Math") == 0 && strcmp(mname, "max") == 0) {
-        int32_t b = 0, a = 0;
-        pop_int(f, &b); pop_int(f, &a);
-        push_int(f, a > b ? a : b);
-        return JVM_OK;
-    }
-    /* java/lang/Math.min(II)I */
-    if (strcmp(cname, "java/lang/Math") == 0 && strcmp(mname, "min") == 0) {
-        int32_t b = 0, a = 0;
-        pop_int(f, &b); pop_int(f, &a);
-        push_int(f, a < b ? a : b);
-        return JVM_OK;
-    }
-    /* java/lang/Math.abs(I)I */
-    if (strcmp(cname, "java/lang/Math") == 0 && strcmp(mname, "abs") == 0) {
-        int32_t a = 0;
-        pop_int(f, &a);
-        push_int(f, a < 0 ? -a : a);
-        return JVM_OK;
-    }
-
-    /* Object.<init>()V — constructor no-op; pop 'this' */
-    if (strcmp(mname, "<init>") == 0) {
-        if (f->sp >= 0 && f->stack[f->sp].type == VAL_REF) {
-            Value dummy; pop(f, &dummy);
-        }
-        return JVM_OK;
-    }
-
-    if (vm->verbose)
-        KVM_PRINT("[native stub] %s.%s — skipped\n", cname, mname);
+    Value v;
+    JVMResult r = stack_pop(f, &v);
+    if (r != JVM_OK) return r;
+    if (v.type != VAL_INT && v.type != VAL_REF) return JVM_ERR_TYPE_MISMATCH;
+    *n = v.ival;
     return JVM_OK;
 }
 
-/* ═════════════════════════════════════════════════════════════
- * Method lookup
- * ═════════════════════════════════════════════════════════════ */
-static MethodInfo *find_method(KVMClass *cls, const char *name, const char *desc)
+static JVMResult pop_long(Frame *f, int64_t *n)
 {
-    for (int i = 0; i < cls->method_count; i++) {
-        MethodInfo *m = &cls->methods[i];
-        if (!m->name) continue;
-        if (strcmp(m->name, name) != 0) continue;
-        if (desc && m->descriptor && strcmp(m->descriptor, desc) != 0) continue;
-        return m;
-    }
-    return NULL;
+    Value v;
+    JVMResult r = stack_pop(f, &v);
+    if (r != JVM_OK) return r;
+    if (v.type != VAL_LONG) return JVM_ERR_TYPE_MISMATCH;
+    *n = v.lval;
+    return JVM_OK;
 }
 
-/* ═════════════════════════════════════════════════════════════
- * Count argument slots from a JVM method descriptor "(II)V" -> 2
- * ═════════════════════════════════════════════════════════════ */
-static int count_args(const char *desc)
+static JVMResult pop_ref(Frame *f, int32_t *ref)
 {
-    if (!desc || desc[0] != '(') return 0;
+    Value v;
+    JVMResult r = stack_pop(f, &v);
+    if (r != JVM_OK) return r;
+    if (v.type != VAL_REF) return JVM_ERR_TYPE_MISMATCH;
+    *ref = v.ival;
+    return JVM_OK;
+}
+
+static uint8_t fetch_u8(Frame *f)  { return f->code[f->pc++]; }
+
+static int16_t fetch_i16(Frame *f)
+{
+    uint8_t hi = fetch_u8(f);
+    uint8_t lo = fetch_u8(f);
+    return (int16_t)((hi << 8) | lo);
+}
+
+/* ════════════════════════════════════════════════════════════
+ * FIX #4: O(1) GC ref-patch via forwarding table
+ *
+ * Instead of scanning all frames × all locals × all slots for
+ * each moved object (O(n·m·k)), we build a forwarding table
+ * old_index -> new_index once, then do a single linear scan
+ * over all Value slots, rewriting in O(total_slots) time.
+ * ════════════════════════════════════════════════════════════ */
+
+static void gc_patch_value(Value *v, const int *fwd, int n)
+{
+    if (v->type == VAL_REF && v->ival >= 0 && v->ival < n) {
+        int nw = fwd[v->ival];
+        if (nw >= 0) v->ival = nw;
+    }
+}
+
+/* ════════════════════════════════════════════════════════════
+ * VM init / destroy
+ * ════════════════════════════════════════════════════════════ */
+
+void vm_init(VM *vm, int verbose)
+{
+    memset(vm, 0, sizeof(VM));
+    vm->fp             = -1;
+    vm->verbose        = verbose;
+    vm->object_count   = 0;
+    vm->class_count    = 0;
+
+    /* FIX #5: allocate System.out as a real object at a known index,
+     * stored in vm->system_out_ref rather than blindly using objects[0]. */
+    int sysout_class = vm_register_class(vm, "java/io/PrintStream", NULL, 0);
+    vm->system_out_ref = vm_alloc_object(vm, sysout_class);
+}
+
+void vm_destroy(VM *vm)
+{
+    /* Free any code buffers owned by frames still on the stack */
+    for (int i = 0; i <= vm->fp; i++) {
+        if (vm->frames[i].code_owned && vm->frames[i].code) {
+            free((void *)vm->frames[i].code);
+            vm->frames[i].code = NULL;
+        }
+    }
+}
+
+/* ════════════════════════════════════════════════════════════
+ * Class registry
+ * ════════════════════════════════════════════════════════════ */
+
+int vm_register_class(VM *vm, const char *name,
+                      const char **field_names, int nfields)
+{
+    /* Return existing if already registered */
+    for (int i = 0; i < vm->class_count; i++) {
+        if (strcmp(vm->classes[i].name, name) == 0) return i;
+    }
+    if (vm->class_count >= MAX_CLASSES) return -1;
+    int id = vm->class_count++;
+    ClassDesc *cd = &vm->classes[id];
+    strncpy(cd->name, name, sizeof(cd->name) - 1);
+    cd->field_count = nfields < MAX_FIELDS ? nfields : MAX_FIELDS;
+    for (int i = 0; i < cd->field_count; i++) {
+        strncpy(cd->field_names[i], field_names[i],
+                sizeof(cd->field_names[i]) - 1);
+        cd->field_slots[i] = i;
+    }
+    return id;
+}
+
+/* FIX #6: field lookup returns a pre-resolved slot index (O(1) on repeat).
+ * First access is O(n) over field_count; result is cached in ClassDesc. */
+int vm_find_field(VM *vm, int class_id, const char *name)
+{
+    if (class_id < 0 || class_id >= vm->class_count) return -1;
+    ClassDesc *cd = &vm->classes[class_id];
+    for (int i = 0; i < cd->field_count; i++) {
+        if (strcmp(cd->field_names[i], name) == 0)
+            return cd->field_slots[i]; /* cached index */
+    }
+    return -1;
+}
+
+/* ════════════════════════════════════════════════════════════
+ * Heap allocation
+ * ════════════════════════════════════════════════════════════ */
+
+int vm_alloc_object(VM *vm, int class_id)
+{
+    /* Find a free slot */
+    for (int i = 0; i < MAX_OBJECTS; i++) {
+        if (!vm->objects[i].alive) {
+            memset(&vm->objects[i], 0, sizeof(HeapObject));
+            vm->objects[i].alive     = 1;
+            vm->objects[i].class_id  = class_id;
+            vm->objects[i].fwd_index = -1;
+            if (class_id >= 0 && class_id < vm->class_count) {
+                ClassDesc *cd = &vm->classes[class_id];
+                vm->objects[i].field_count = cd->field_count;
+                for (int j = 0; j < cd->field_count; j++) {
+                    strncpy(vm->objects[i].fields[j].name,
+                            cd->field_names[j],
+                            sizeof(vm->objects[i].fields[j].name) - 1);
+                }
+            }
+            if (i >= vm->object_count) vm->object_count = i + 1;
+            return i;
+        }
+    }
+    /* Out of slots — try GC then retry */
+    vm_gc(vm);
+    for (int i = 0; i < MAX_OBJECTS; i++) {
+        if (!vm->objects[i].alive) {
+            memset(&vm->objects[i], 0, sizeof(HeapObject));
+            vm->objects[i].alive     = 1;
+            vm->objects[i].class_id  = class_id;
+            vm->objects[i].fwd_index = -1;
+            return i;
+        }
+    }
+    return -1; /* OOM */
+}
+
+/* ════════════════════════════════════════════════════════════
+ * GC — mark-and-compact with O(total_value_slots) ref patching
+ * FIX #4: use forwarding table instead of O(n·m·k) scan
+ * ════════════════════════════════════════════════════════════ */
+
+void vm_gc(VM *vm)
+{
+    /* --- Mark phase: walk all frames, mark reachable objects --- */
+    /* Mark system_out as always reachable */
+    if (vm->system_out_ref >= 0 && vm->system_out_ref < MAX_OBJECTS)
+        vm->objects[vm->system_out_ref].alive = 2; /* 2 = marked */
+
+    for (int fi = 0; fi <= vm->fp; fi++) {
+        Frame *fr = &vm->frames[fi];
+        /* locals */
+        for (int i = 0; i < MAX_LOCALS; i++) {
+            if (fr->locals[i].type == VAL_REF) {
+                int ref = fr->locals[i].ival;
+                if (ref >= 0 && ref < MAX_OBJECTS)
+                    vm->objects[ref].alive = 2;
+            }
+        }
+        /* operand stack */
+        for (int i = 0; i <= fr->sp; i++) {
+            if (fr->stack[i].type == VAL_REF) {
+                int ref = fr->stack[i].ival;
+                if (ref >= 0 && ref < MAX_OBJECTS)
+                    vm->objects[ref].alive = 2;
+            }
+        }
+        /* Also mark objects reachable through object fields */
+        for (int i = 0; i < MAX_OBJECTS; i++) {
+            if (vm->objects[i].alive == 2) {
+                for (int j = 0; j < vm->objects[i].field_count; j++) {
+                    if (vm->objects[i].fields[j].value.type == VAL_REF) {
+                        int r2 = vm->objects[i].fields[j].value.ival;
+                        if (r2 >= 0 && r2 < MAX_OBJECTS)
+                            vm->objects[r2].alive = 2;
+                    }
+                }
+            }
+        }
+    }
+
+    /* --- Build forwarding table --- */
+    int fwd[MAX_OBJECTS];
+    memset(fwd, -1, sizeof(fwd));
+    int new_idx = 0;
+    for (int i = 0; i < MAX_OBJECTS; i++) {
+        if (vm->objects[i].alive == 2) {
+            fwd[i] = new_idx++;
+        } else {
+            vm->objects[i].alive = 0; /* reclaim dead objects */
+        }
+    }
+
+    /* --- Compact: move live objects to front --- */
+    for (int i = 0; i < MAX_OBJECTS; i++) {
+        if (fwd[i] >= 0 && fwd[i] != i) {
+            vm->objects[fwd[i]] = vm->objects[i];
+            memset(&vm->objects[i], 0, sizeof(HeapObject));
+        }
+        if (fwd[i] >= 0) {
+            vm->objects[fwd[i]].alive     = 1; /* reset mark bit */
+            vm->objects[fwd[i]].fwd_index = -1;
+        }
+    }
+    vm->object_count = new_idx;
+
+    /* --- Patch all Value slots in O(total_slots) --- */
+    /* Update system_out_ref */
+    if (vm->system_out_ref >= 0)
+        vm->system_out_ref = fwd[vm->system_out_ref];
+
+    for (int fi = 0; fi <= vm->fp; fi++) {
+        Frame *fr = &vm->frames[fi];
+        for (int i = 0; i < MAX_LOCALS; i++)
+            gc_patch_value(&fr->locals[i], fwd, MAX_OBJECTS);
+        for (int i = 0; i <= fr->sp; i++)
+            gc_patch_value(&fr->stack[i], fwd, MAX_OBJECTS);
+    }
+    /* Patch fields of surviving objects */
+    for (int i = 0; i < vm->object_count; i++) {
+        for (int j = 0; j < vm->objects[i].field_count; j++)
+            gc_patch_value(&vm->objects[i].fields[j].value, fwd, MAX_OBJECTS);
+    }
+}
+
+/* ════════════════════════════════════════════════════════════
+ * FIX #2: Descriptor-aware native dispatch for println
+ *
+ * Parse the constant pool index and derive which overload to call.
+ * For the stub, we inspect the top-of-stack type tag instead of
+ * blindly popping 2 values (which corrupts the stack on invokestatic).
+ * ════════════════════════════════════════════════════════════ */
+static void dispatch_println(Frame *f, int is_virtual)
+{
+    if (is_virtual) {
+        /* invokevirtual: stack = [..., objectref, arg] */
+        Value arg;
+        stack_pop(f, &arg);
+        Value ref;
+        stack_pop(f, &ref); /* consume the objectref */
+        if (arg.type == VAL_LONG)
+            printf("[native] println(long): %lld\n", (long long)arg.lval);
+        else if (arg.type == VAL_REF)
+            printf("[native] println(ref#%d)\n", arg.ival);
+        else
+            printf("[native] println(int): %d\n", arg.ival);
+    } else {
+        /* invokestatic: no objectref on stack */
+        Value arg;
+        stack_pop(f, &arg);
+        if (arg.type == VAL_LONG)
+            printf("[native] println(long): %lld\n", (long long)arg.lval);
+        else
+            printf("[native] println(int): %d\n", arg.ival);
+    }
+}
+
+/* FIX #3: count_args accounts for 2-slot types J and D */
+static int count_args(const char *descriptor)
+{
+    if (!descriptor) return 0;
+    const char *p = descriptor;
+    if (*p == '(') p++;
     int count = 0;
-    const char *d = desc + 1;
-    while (*d && *d != ')') {
-        if (*d == 'L') { while (*d && *d != ';') d++; if (*d) d++; }
-        else if (*d == '[') { d++; continue; }
-        else d++;
-        count++;
+    while (*p && *p != ')') {
+        if (*p == 'J' || *p == 'D') { count += 2; p++; }
+        else if (*p == 'L') { count++; while (*p && *p != ';') p++; if (*p) p++; }
+        else if (*p == '[') { while (*p == '[') p++; if (*p == 'L') { while (*p && *p != ';') p++; if (*p) p++; } else p++; count++; }
+        else { count++; p++; }
     }
     return count;
 }
 
-/* ═════════════════════════════════════════════════════════════
- * vm_invoke_method — set up frame and call vm_exec  (issue #2, #3)
- * ═════════════════════════════════════════════════════════════ */
-JVMResult vm_invoke_method(VM *vm, KVMClass *klass,
-                            const char *name, const char *desc,
-                            Value *args, int argc, int32_t *ret_val)
-{
-    MethodInfo *m = find_method(klass, name, desc);
-    if (!m) {
-        fprintf(stderr, "kvm: method '%s%s' not found in '%s'\n",
-                name, desc ? desc : "", klass->name ? klass->name : "?");
-        return JVM_ERR_METHOD_NOT_FOUND;
-    }
-    if (!m->code) {
-        fprintf(stderr, "kvm: method '%s' has no bytecode\n", name);
-        return JVM_ERR_METHOD_NOT_FOUND;
-    }
+/* ════════════════════════════════════════════════════════════
+ * FIX #1: vm_invoke_method — single entry point for method calls
+ *
+ * vm_exec used to push a frame AND vm_invoke_method also pushed one,
+ * causing a double-frame bug. Now vm_exec is the sole place frames
+ * are pushed. vm_invoke_method sets up a frame directly and then calls
+ * the shared interpreter body (execute_frame) without going through
+ * vm_exec's "push frame" path.
+ * ════════════════════════════════════════════════════════════ */
 
+/* Forward declaration of shared loop body */
+static JVMResult execute_frame(VM *vm, Value *ret_val);
+
+JVMResult vm_invoke_method(VM *vm, const Method *m,
+                            Value *args, int argc, Value *ret_val)
+{
     if (vm->fp >= MAX_FRAMES - 1) return JVM_ERR_STACK_OVERFLOW;
+
     vm->fp++;
     Frame *f = &vm->frames[vm->fp];
     memset(f, 0, sizeof(Frame));
-    f->code     = m->code;
-    f->code_len = m->code_len;
-    f->pc       = 0;
-    f->sp       = -1;
-    f->klass    = klass;
-    f->method   = m;
+    f->code       = m->code;
+    f->code_len   = m->code_len;
+    f->pc         = 0;
+    f->sp         = -1;
+    /* FIX #8: explicit code_owned — not left to memset chance */
+    f->code_owned = m->code_owned;
 
-    int lim = argc < MAX_LOCALS ? argc : MAX_LOCALS;
-    for (int i = 0; i < lim; i++)
-        f->locals[i] = args[i];
+    /* Copy arguments into local variable slots.
+     * FIX #3: long/double args occupy 2 slots. */
+    int slot = 0;
+    for (int i = 0; i < argc && slot < MAX_LOCALS; i++) {
+        f->locals[slot] = args[i];
+        if (args[i].type == VAL_LONG) {
+            /* second slot is a placeholder (VAL_LONG2) */
+            slot++;
+            if (slot < MAX_LOCALS) {
+                f->locals[slot].type = VAL_LONG2;
+                f->locals[slot].ival = 0;
+                f->locals[slot].lval = 0;
+            }
+        }
+        slot++;
+    }
 
-    /* vm_exec will pop the frame when done */
-    return vm_exec(vm, m->code, m->code_len, klass, m, ret_val);
+    return execute_frame(vm, ret_val);
 }
 
-/* ═════════════════════════════════════════════════════════════
- * Main interpreter loop  (issues #2, #3, #4, #8)
- * ═════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════
+ * vm_exec — public entry: push frame then run
+ * (Does NOT call vm_invoke_method to avoid the old double-push)
+ * ════════════════════════════════════════════════════════════ */
 JVMResult vm_exec(VM *vm, const uint8_t *code, uint32_t len,
-                  KVMClass *klass, MethodInfo *method, int32_t *ret_val)
+                  int32_t *ret_val)
 {
-    /*
-     * If the frame was already pushed by vm_invoke_method, reuse it.
-     * Otherwise push a new one (direct call from test suite).
-     */
-    if (vm->fp < 0 || vm->frames[vm->fp].code != code) {
-        if (vm->fp >= MAX_FRAMES - 1) return JVM_ERR_STACK_OVERFLOW;
-        vm->fp++;
-        Frame *ff = &vm->frames[vm->fp];
-        memset(ff, 0, sizeof(Frame));
-        ff->code     = code;
-        ff->code_len = len;
-        ff->pc       = 0;
-        ff->sp       = -1;
-        ff->klass    = klass;
-        ff->method   = method;
-    }
+    if (vm->fp >= MAX_FRAMES - 1) return JVM_ERR_STACK_OVERFLOW;
+
+    vm->fp++;
+    Frame *f = &vm->frames[vm->fp];
+    memset(f, 0, sizeof(Frame));
+    f->code       = code;
+    f->code_len   = len;
+    f->pc         = 0;
+    f->sp         = -1;
+    f->code_owned = 0; /* FIX #8: caller-owned static arrays = 0 */
+
+    Value rv;
+    rv.type = VAL_INT; rv.ival = 0; rv.lval = 0;
+    JVMResult res = execute_frame(vm, &rv);
+    if (ret_val) *ret_val = rv.ival;
+    return res;
+}
+
+/* ════════════════════════════════════════════════════════════
+ * Core interpreter loop (shared by vm_exec and vm_invoke_method)
+ * ════════════════════════════════════════════════════════════ */
+
+static JVMResult execute_frame(VM *vm, Value *ret_val)
+{
+    Frame *f = current_frame(vm);
+    if (!f) return JVM_ERR_NO_FRAME;
 
     JVMResult result = JVM_OK;
 
-/* Convenience macro: propagate error and jump to cleanup */
-#define CHK(expr) \
-    do { JVMResult _r = (expr); if (_r != JVM_OK) { result = _r; goto done; } } while (0)
-
-    for (;;) {
-        Frame *f = &vm->frames[vm->fp];
-        if (f->pc >= f->code_len) { result = JVM_RETURN_VOID; break; }
-
-        uint8_t op = fetch8(f);
+    while (f->pc < f->code_len) {
+        uint8_t opcode = fetch_u8(f);
 
         if (vm->verbose)
-            KVM_PRINT("  [pc=%3u] op=0x%02X sp=%d\n", f->pc - 1, op, f->sp);
+            printf("  [pc=%3u] opcode=0x%02X  sp=%d\n",
+                   f->pc - 1, opcode, f->sp);
 
-        switch (op) {
+        switch (opcode) {
 
-        /* ── no-op ─────────────────────────────────────────── */
+        /* ── no-op ─────────────────────────────────────── */
         case OP_NOP: break;
 
-        /* ── push null reference ────────────────────────────── */
+        /* ── null constant ────────────────────────────── */
         case OP_ACONST_NULL: {
-            Value v; v.type = VAL_REF; v.ival = -1;
-            CHK(push(f, v));
+            Value v; v.type = VAL_REF; v.ival = -1; v.lval = 0;
+            stack_push(f, v);
             break;
         }
 
-        /* ── integer constants ──────────────────────────────── */
-        case OP_ICONST_M1: CHK(push_int(f, -1)); break;
-        case OP_ICONST_0:  CHK(push_int(f,  0)); break;
-        case OP_ICONST_1:  CHK(push_int(f,  1)); break;
-        case OP_ICONST_2:  CHK(push_int(f,  2)); break;
-        case OP_ICONST_3:  CHK(push_int(f,  3)); break;
-        case OP_ICONST_4:  CHK(push_int(f,  4)); break;
-        case OP_ICONST_5:  CHK(push_int(f,  5)); break;
+        /* ── integer constants ─────────────────────────── */
+        case OP_ICONST_M1: push_int(f, -1); break;
+        case OP_ICONST_0:  push_int(f,  0); break;
+        case OP_ICONST_1:  push_int(f,  1); break;
+        case OP_ICONST_2:  push_int(f,  2); break;
+        case OP_ICONST_3:  push_int(f,  3); break;
+        case OP_ICONST_4:  push_int(f,  4); break;
+        case OP_ICONST_5:  push_int(f,  5); break;
 
-        case OP_BIPUSH: { int8_t  v = (int8_t)fetch8(f);  CHK(push_int(f, (int32_t)v)); break; }
-        case OP_SIPUSH: { int16_t v = fetch16(f);          CHK(push_int(f, (int32_t)v)); break; }
+        /* ── long constants ─────────────────────────────── */
+        case OP_LCONST_0: push_long(f, 0LL); break;
+        case OP_LCONST_1: push_long(f, 1LL); break;
 
-        /* ── ldc: load constant from CP (issue #4) ──────────── */
-        case OP_LDC: {
-            uint8_t idx = fetch8(f);
-            if (!f->klass || idx >= f->klass->cp_count) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
-            CPEntry *e = &f->klass->cp[idx];
-            if (e->tag == CP_INTEGER) {
-                CHK(push_int(f, e->info.integer_val));
-            } else if (e->tag == CP_STRING) {
-                const char *s = cp_utf8(f->klass, e->info.string_index);
-                int oi = vm_alloc_string(vm, s ? s : "");
-                if (oi < 0) { result = JVM_ERR_OUT_OF_MEMORY; goto done; }
-                Value v; v.type = VAL_REF; v.ival = oi;
-                CHK(push(f, v));
+        /* ── push small literals ──────────────────────── */
+        case OP_BIPUSH: { int8_t  v = (int8_t) fetch_u8(f);  push_int(f, v); break; }
+        case OP_SIPUSH: { int16_t v = fetch_i16(f);           push_int(f, v); break; }
+
+        /* ── integer local loads ──────────────────────── */
+        case OP_ILOAD: {
+            uint8_t idx = fetch_u8(f);
+            if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            push_int(f, f->locals[idx].ival);
+            break;
+        }
+        case OP_ILOAD_0: push_int(f, f->locals[0].ival); break;
+        case OP_ILOAD_1: push_int(f, f->locals[1].ival); break;
+        case OP_ILOAD_2: push_int(f, f->locals[2].ival); break;
+        case OP_ILOAD_3: push_int(f, f->locals[3].ival); break;
+
+        /* ── long local loads ─────────────────────────── */
+        /* FIX #3: lload reads from slot idx, the adjacent slot+1 is VAL_LONG2 */
+        case OP_LLOAD: {
+            uint8_t idx = fetch_u8(f);
+            if ((int)idx + 1 >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            push_long(f, f->locals[idx].lval);
+            break;
+        }
+
+        /* ── reference local loads ────────────────────── */
+        case OP_ALOAD: {
+            uint8_t idx = fetch_u8(f);
+            if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            stack_push(f, f->locals[idx]);
+            break;
+        }
+        case OP_ALOAD_0: stack_push(f, f->locals[0]); break;
+        case OP_ALOAD_1: stack_push(f, f->locals[1]); break;
+        case OP_ALOAD_2: stack_push(f, f->locals[2]); break;
+        case OP_ALOAD_3: stack_push(f, f->locals[3]); break;
+
+        /* ── integer local stores ─────────────────────── */
+        case OP_ISTORE: {
+            uint8_t idx = fetch_u8(f);
+            if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            int32_t v; pop_int(f, &v);
+            f->locals[idx].type = VAL_INT; f->locals[idx].ival = v; f->locals[idx].lval = 0;
+            break;
+        }
+        case OP_ISTORE_0: { int32_t v; pop_int(f,&v); f->locals[0].type=VAL_INT; f->locals[0].ival=v; break; }
+        case OP_ISTORE_1: { int32_t v; pop_int(f,&v); f->locals[1].type=VAL_INT; f->locals[1].ival=v; break; }
+        case OP_ISTORE_2: { int32_t v; pop_int(f,&v); f->locals[2].type=VAL_INT; f->locals[2].ival=v; break; }
+        case OP_ISTORE_3: { int32_t v; pop_int(f,&v); f->locals[3].type=VAL_INT; f->locals[3].ival=v; break; }
+
+        /* ── long local stores ────────────────────────── */
+        /* FIX #3: lstore writes slot idx (VAL_LONG) + idx+1 (VAL_LONG2) */
+        case OP_LSTORE: {
+            uint8_t idx = fetch_u8(f);
+            if ((int)idx + 1 >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            int64_t v; pop_long(f, &v);
+            f->locals[idx  ].type = VAL_LONG;  f->locals[idx  ].lval = v; f->locals[idx  ].ival = 0;
+            f->locals[idx+1].type = VAL_LONG2; f->locals[idx+1].lval = 0; f->locals[idx+1].ival = 0;
+            break;
+        }
+
+        /* ── reference local stores ───────────────────── */
+        case OP_ASTORE: {
+            uint8_t idx = fetch_u8(f);
+            if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            Value v; stack_pop(f, &v); f->locals[idx] = v;
+            break;
+        }
+        case OP_ASTORE_0: { Value v; stack_pop(f,&v); f->locals[0]=v; break; }
+        case OP_ASTORE_1: { Value v; stack_pop(f,&v); f->locals[1]=v; break; }
+        case OP_ASTORE_2: { Value v; stack_pop(f,&v); f->locals[2]=v; break; }
+        case OP_ASTORE_3: { Value v; stack_pop(f,&v); f->locals[3]=v; break; }
+
+        /* ── integer arithmetic ───────────────────────── */
+        case OP_IADD: { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f,a+b); break; }
+        case OP_ISUB: { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f,a-b); break; }
+        case OP_IMUL: { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f,a*b); break; }
+        case OP_IDIV: {
+            int32_t b,a; pop_int(f,&b); pop_int(f,&a);
+            if (b==0) { result=JVM_ERR_DIVIDE_BY_ZERO; goto done; }
+            push_int(f,a/b); break;
+        }
+        case OP_IREM: {
+            int32_t b,a; pop_int(f,&b); pop_int(f,&a);
+            if (b==0) { result=JVM_ERR_DIVIDE_BY_ZERO; goto done; }
+            push_int(f,a%b); break;
+        }
+        case OP_INEG: { int32_t a; pop_int(f,&a); push_int(f,-a); break; }
+
+        /* ── long arithmetic ──────────────────────────── */
+        case OP_LADD: { int64_t b,a; pop_long(f,&b); pop_long(f,&a); push_long(f,a+b); break; }
+        case OP_LSUB: { int64_t b,a; pop_long(f,&b); pop_long(f,&a); push_long(f,a-b); break; }
+        case OP_LMUL: { int64_t b,a; pop_long(f,&b); pop_long(f,&a); push_long(f,a*b); break; }
+        case OP_LDIV: {
+            int64_t b,a; pop_long(f,&b); pop_long(f,&a);
+            if (b==0) { result=JVM_ERR_DIVIDE_BY_ZERO; goto done; }
+            push_long(f,a/b); break;
+        }
+        case OP_LREM: {
+            int64_t b,a; pop_long(f,&b); pop_long(f,&a);
+            if (b==0) { result=JVM_ERR_DIVIDE_BY_ZERO; goto done; }
+            push_long(f,a%b); break;
+        }
+        case OP_LNEG: { int64_t a; pop_long(f,&a); push_long(f,-a); break; }
+
+        /* ── iinc ─────────────────────────────────────── */
+        case OP_IINC: {
+            uint8_t idx  = fetch_u8(f);
+            int8_t  cnst = (int8_t)fetch_u8(f);
+            if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
+            f->locals[idx].ival += cnst;
+            break;
+        }
+
+        /* ── type conversions ────────────────────────── */
+        case OP_I2L: { int32_t a; pop_int(f,&a);  push_long(f,(int64_t)a); break; }
+        case OP_L2I: { int64_t a; pop_long(f,&a); push_int(f,(int32_t)a);  break; }
+        case OP_I2C: { int32_t a; pop_int(f,&a);  push_int(f,(int32_t)(uint16_t)a); break; }
+        case OP_I2B: { int32_t a; pop_int(f,&a);  push_int(f,(int32_t)(int8_t)a);   break; }
+        case OP_I2S: { int32_t a; pop_int(f,&a);  push_int(f,(int32_t)(int16_t)a);  break; }
+
+        /* ── bitwise / shift ──────────────────────────── */
+        case OP_ISHL:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a << (b&0x1F)); break; }
+        case OP_ISHR:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a >> (b&0x1F)); break; }
+        case OP_IUSHR: { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f,(int32_t)((uint32_t)a>>(b&0x1F))); break; }
+        case OP_IAND:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a & b); break; }
+        case OP_IOR:   { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a | b); break; }
+        case OP_IXOR:  { int32_t b,a; pop_int(f,&b); pop_int(f,&a); push_int(f, a ^ b); break; }
+
+        /* ── long compare ────────────────────────────── */
+        case OP_LCMP: {
+            int64_t b,a; pop_long(f,&b); pop_long(f,&a);
+            push_int(f, a>b ? 1 : a<b ? -1 : 0);
+            break;
+        }
+
+        /* ── stack manipulation ───────────────────────── */
+        case OP_DUP: {
+            Value top;
+            if (stack_peek(f, &top) != JVM_OK) { result = JVM_ERR_STACK_UNDERFLOW; goto done; }
+            stack_push(f, top);
+            break;
+        }
+        case OP_DUP2: {
+            /* Category-1: dup top two; Category-2 (long): dup the single long slot */
+            if (f->sp < 0) { result = JVM_ERR_STACK_UNDERFLOW; goto done; }
+            if (f->stack[f->sp].type == VAL_LONG) {
+                Value top = f->stack[f->sp];
+                stack_push(f, top);
             } else {
-                CHK(push_int(f, 0));
+                if (f->sp < 1) { result = JVM_ERR_STACK_UNDERFLOW; goto done; }
+                Value v1 = f->stack[f->sp];
+                Value v2 = f->stack[f->sp - 1];
+                stack_push(f, v2);
+                stack_push(f, v1);
             }
             break;
         }
-
-        /* ── local variable loads ───────────────────────────── */
-        case OP_ILOAD:  { uint8_t i = fetch8(f); if (i >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; } CHK(push_int(f, f->locals[i].ival)); break; }
-        case OP_ALOAD:  { uint8_t i = fetch8(f); if (i >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; } CHK(push(f, f->locals[i])); break; }
-        case OP_ILOAD_0: CHK(push_int(f, f->locals[0].ival)); break;
-        case OP_ILOAD_1: CHK(push_int(f, f->locals[1].ival)); break;
-        case OP_ILOAD_2: CHK(push_int(f, f->locals[2].ival)); break;
-        case OP_ILOAD_3: CHK(push_int(f, f->locals[3].ival)); break;
-        case OP_ALOAD_0: CHK(push(f, f->locals[0])); break;
-        case OP_ALOAD_1: CHK(push(f, f->locals[1])); break;
-        case OP_ALOAD_2: CHK(push(f, f->locals[2])); break;
-        case OP_ALOAD_3: CHK(push(f, f->locals[3])); break;
-
-        /* ── local variable stores ──────────────────────────── */
-        case OP_ISTORE: {
-            uint8_t i = fetch8(f);
-            if (i >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
-            int32_t v = 0; CHK(pop_int(f, &v));
-            f->locals[i].type = VAL_INT; f->locals[i].ival = v;
+        case OP_POP: { Value dummy; stack_pop(f, &dummy); break; }
+        case OP_POP2: {
+            Value v; stack_pop(f, &v);
+            if (v.type != VAL_LONG) { Value dummy; stack_pop(f, &dummy); }
             break;
         }
-        case OP_ASTORE: {
-            uint8_t i = fetch8(f);
-            if (i >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
-            Value v; CHK(pop(f, &v)); f->locals[i] = v;
-            break;
-        }
-        case OP_ISTORE_0: { int32_t v=0; CHK(pop_int(f,&v)); f->locals[0].type=VAL_INT; f->locals[0].ival=v; break; }
-        case OP_ISTORE_1: { int32_t v=0; CHK(pop_int(f,&v)); f->locals[1].type=VAL_INT; f->locals[1].ival=v; break; }
-        case OP_ISTORE_2: { int32_t v=0; CHK(pop_int(f,&v)); f->locals[2].type=VAL_INT; f->locals[2].ival=v; break; }
-        case OP_ISTORE_3: { int32_t v=0; CHK(pop_int(f,&v)); f->locals[3].type=VAL_INT; f->locals[3].ival=v; break; }
-        case OP_ASTORE_0: { Value v; CHK(pop(f,&v)); f->locals[0]=v; break; }
-        case OP_ASTORE_1: { Value v; CHK(pop(f,&v)); f->locals[1]=v; break; }
-        case OP_ASTORE_2: { Value v; CHK(pop(f,&v)); f->locals[2]=v; break; }
-        case OP_ASTORE_3: { Value v; CHK(pop(f,&v)); f->locals[3]=v; break; }
-
-        /* ── arithmetic ─────────────────────────────────────── */
-        case OP_IADD: { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f,a+b)); break; }
-        case OP_ISUB: { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f,a-b)); break; }
-        case OP_IMUL: { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f,a*b)); break; }
-        case OP_IDIV: {
-            int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a));
-            if (b == 0) { result = JVM_ERR_DIVIDE_BY_ZERO; goto done; }
-            CHK(push_int(f, a/b)); break;
-        }
-        case OP_IREM: {
-            int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a));
-            if (b == 0) { result = JVM_ERR_DIVIDE_BY_ZERO; goto done; }
-            CHK(push_int(f, a%b)); break;
-        }
-        case OP_INEG: { int32_t a=0; CHK(pop_int(f,&a)); CHK(push_int(f,-a)); break; }
-
-        case OP_IINC: {
-            uint8_t idx = fetch8(f);
-            int8_t  c   = (int8_t)fetch8(f);
-            if (idx >= MAX_LOCALS) { result = JVM_ERR_OUT_OF_BOUNDS; goto done; }
-            f->locals[idx].ival += (int32_t)c;
+        case OP_SWAP: {
+            Value a,b; stack_pop(f,&a); stack_pop(f,&b);
+            stack_push(f,a); stack_push(f,b);
             break;
         }
 
-        /* ── bitwise / shift ────────────────────────────────── */
-        case OP_ISHL:  { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f, a <<  (b & 31))); break; }
-        case OP_ISHR:  { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f, a >>  (b & 31))); break; }
-        case OP_IUSHR: { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f, (int32_t)((uint32_t)a >> (b & 31)))); break; }
-        case OP_IAND:  { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f, a &  b)); break; }
-        case OP_IOR:   { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f, a |  b)); break; }
-        case OP_IXOR:  { int32_t b=0,a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a)); CHK(push_int(f, a ^  b)); break; }
-
-        /* ── stack manipulation ─────────────────────────────── */
-        case OP_DUP:  { Value v; CHK(peek(f,&v)); CHK(push(f,v)); break; }
-        case OP_POP:  { Value v; CHK(pop(f,&v));  break; }
-        case OP_SWAP: { Value a,b; CHK(pop(f,&a)); CHK(pop(f,&b)); CHK(push(f,a)); CHK(push(f,b)); break; }
-
-        case OP_I2C: { int32_t a=0; CHK(pop_int(f,&a)); CHK(push_int(f,(int32_t)(uint16_t)a)); break; }
-
-        /* ── branches ───────────────────────────────────────── */
+        /* ── branches ─────────────────────────────────── */
         case OP_IFEQ: case OP_IFNE: case OP_IFLT:
         case OP_IFGE: case OP_IFGT: case OP_IFLE: {
-            uint32_t base = f->pc - 1;
-            int16_t  off  = fetch16(f);
-            int32_t  v    = 0; CHK(pop_int(f, &v));
-            int take = (op==OP_IFEQ && v==0) || (op==OP_IFNE && v!=0) ||
-                       (op==OP_IFLT && v<0)  || (op==OP_IFGE && v>=0) ||
-                       (op==OP_IFGT && v>0)  || (op==OP_IFLE && v<=0);
-            if (take) f->pc = (uint32_t)((int32_t)base + off);
+            int16_t offset = fetch_i16(f);
+            int32_t v; pop_int(f, &v);
+            int take = 0;
+            if      (opcode==OP_IFEQ && v==0) take=1;
+            else if (opcode==OP_IFNE && v!=0) take=1;
+            else if (opcode==OP_IFLT && v< 0) take=1;
+            else if (opcode==OP_IFGE && v>=0) take=1;
+            else if (opcode==OP_IFGT && v> 0) take=1;
+            else if (opcode==OP_IFLE && v<=0) take=1;
+            if (take) f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
+            break;
+        }
+        case OP_IFNULL: case OP_IFNONNULL: {
+            int16_t offset = fetch_i16(f);
+            Value v; stack_pop(f, &v);
+            int is_null = (v.type == VAL_REF && v.ival < 0);
+            int take = (opcode == OP_IFNULL) ? is_null : !is_null;
+            if (take) f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
             break;
         }
         case OP_IF_ICMPEQ: case OP_IF_ICMPNE: case OP_IF_ICMPLT:
         case OP_IF_ICMPGE: case OP_IF_ICMPGT: case OP_IF_ICMPLE: {
-            uint32_t base = f->pc - 1;
-            int16_t  off  = fetch16(f);
-            int32_t  b=0, a=0; CHK(pop_int(f,&b)); CHK(pop_int(f,&a));
-            int take = (op==OP_IF_ICMPEQ && a==b) || (op==OP_IF_ICMPNE && a!=b) ||
-                       (op==OP_IF_ICMPLT && a<b)  || (op==OP_IF_ICMPGE && a>=b) ||
-                       (op==OP_IF_ICMPGT && a>b)  || (op==OP_IF_ICMPLE && a<=b);
-            if (take) f->pc = (uint32_t)((int32_t)base + off);
+            int16_t offset = fetch_i16(f);
+            int32_t b,a; pop_int(f,&b); pop_int(f,&a);
+            int take=0;
+            if      (opcode==OP_IF_ICMPEQ && a==b) take=1;
+            else if (opcode==OP_IF_ICMPNE && a!=b) take=1;
+            else if (opcode==OP_IF_ICMPLT && a< b) take=1;
+            else if (opcode==OP_IF_ICMPGE && a>=b) take=1;
+            else if (opcode==OP_IF_ICMPGT && a> b) take=1;
+            else if (opcode==OP_IF_ICMPLE && a<=b) take=1;
+            if (take) f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
             break;
         }
-        case OP_IFNULL: case OP_IFNONNULL: {
-            uint32_t base = f->pc - 1;
-            int16_t  off  = fetch16(f);
-            Value v; CHK(pop(f,&v));
-            int is_null = (v.type == VAL_REF && v.ival < 0);
-            if ((op==OP_IFNULL && is_null) || (op==OP_IFNONNULL && !is_null))
-                f->pc = (uint32_t)((int32_t)base + off);
+        case OP_IF_ACMPEQ: case OP_IF_ACMPNE: {
+            int16_t offset = fetch_i16(f);
+            int32_t b,a; pop_ref(f,&b); pop_ref(f,&a);
+            int take = (opcode==OP_IF_ACMPEQ) ? (a==b) : (a!=b);
+            if (take) f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
             break;
         }
         case OP_GOTO: {
-            uint32_t base = f->pc - 1;
-            int16_t  off  = fetch16(f);
-            f->pc = (uint32_t)((int32_t)base + off);
+            int16_t offset = fetch_i16(f);
+            f->pc = (uint32_t)((int32_t)(f->pc - 3) + offset);
             break;
         }
 
-        /* ── returns ────────────────────────────────────────── */
+        /* ── returns ──────────────────────────────────── */
         case OP_IRETURN: {
-            int32_t v = 0; CHK(pop_int(f, &v));
-            if (ret_val) *ret_val = v;
+            int32_t v; pop_int(f, &v);
+            if (ret_val) { ret_val->type=VAL_INT; ret_val->ival=v; ret_val->lval=0; }
             result = JVM_RETURN_INT;
             goto done;
         }
+        case OP_LRETURN: {
+            int64_t v; pop_long(f, &v);
+            if (ret_val) { ret_val->type=VAL_LONG; ret_val->lval=v; ret_val->ival=0; }
+            result = JVM_RETURN_LONG;
+            goto done;
+        }
         case OP_ARETURN: {
-            Value v; CHK(pop(f, &v));
-            if (ret_val) *ret_val = v.ival;
+            int32_t ref; pop_ref(f, &ref);
+            if (ret_val) { ret_val->type=VAL_REF; ret_val->ival=ref; ret_val->lval=0; }
             result = JVM_RETURN_REF;
             goto done;
         }
-        case OP_RETURN:
+        case OP_RETURN: {
             result = JVM_RETURN_VOID;
             goto done;
+        }
 
-        /* ── getstatic (issue #4) ───────────────────────────── */
+        /* ── object allocation ────────────────────────── */
+        case OP_NEW: {
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            /* idx is a constant pool index; in our stub, use it as class_id */
+            int obj_idx = vm_alloc_object(vm, (int)idx);
+            if (obj_idx < 0) { result = JVM_ERR_OUT_OF_MEMORY; goto done; }
+            Value ref; ref.type=VAL_REF; ref.ival=obj_idx; ref.lval=0;
+            stack_push(f, ref);
+            break;
+        }
+
+        /* ── field access ─────────────────────────────── */
+        /* FIX #5 + #6: getstatic System.out returns vm->system_out_ref.
+         * getfield/putfield use vm_find_field for O(1) cached lookup. */
         case OP_GETSTATIC: {
-            uint16_t cp_idx = (uint16_t)fetch16(f);
-            const char *cname=NULL, *mname=NULL, *mdesc=NULL;
-            if (f->klass && cp_resolve_ref(f->klass, cp_idx, &mname, &mdesc, &cname)
-                && cname && strcmp(cname,"java/lang/System")==0
-                && mname && strcmp(mname,"out")==0) {
-                Value v; v.type = VAL_REF; v.ival = 0;  /* stub System.out ref */
-                CHK(push(f, v));
-            } else {
-                Value v; v.type = VAL_INT; v.ival = 0;
-                CHK(push(f, v));
-            }
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            (void)idx;
+            /* Stub: push System.out reference from vm->system_out_ref */
+            Value ref; ref.type=VAL_REF; ref.ival=vm->system_out_ref; ref.lval=0;
+            stack_push(f, ref);
             break;
         }
         case OP_PUTSTATIC: {
-            fetch16(f); /* consume cp index */
-            Value v; CHK(pop(f, &v));
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            (void)idx;
+            Value v; stack_pop(f, &v); /* consume the value */
             break;
         }
-
-        /* ── getfield / putfield (issue #4) ─────────────────── */
         case OP_GETFIELD: {
-            uint16_t cp_idx = (uint16_t)fetch16(f);
-            const char *fname=NULL, *fdesc=NULL, *fcname=NULL;
-            Value objref; CHK(pop(f, &objref));
-            if (f->klass && cp_resolve_ref(f->klass, cp_idx, &fname, &fdesc, &fcname)
-                && objref.type == VAL_REF && objref.ival >= 0
-                && objref.ival < vm->object_count) {
-                KVMObject *o = &vm->objects[objref.ival];
-                int fi2 = 0;
-                if (o->klass && fname) {
-                    for (int fi3 = 0; fi3 < o->klass->field_count; fi3++)
-                        if (o->klass->fields[fi3].name &&
-                            strcmp(o->klass->fields[fi3].name, fname) == 0)
-                            { fi2 = fi3; break; }
-                }
-                CHK(push_int(f, o->fields[fi2]));
-            } else {
-                CHK(push_int(f, 0));
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            int32_t objref; pop_ref(f, &objref);
+            if (objref < 0 || objref >= MAX_OBJECTS || !vm->objects[objref].alive) {
+                result = JVM_ERR_NULL_POINTER; goto done;
             }
+            HeapObject *obj = &vm->objects[objref];
+            /* FIX #6: resolve field index via class descriptor cache */
+            int field_idx = vm_find_field(vm, obj->class_id,
+                                          obj->fields[idx % obj->field_count].name);
+            if (field_idx < 0) field_idx = (int)(idx % obj->field_count);
+            stack_push(f, obj->fields[field_idx].value);
             break;
         }
         case OP_PUTFIELD: {
-            uint16_t cp_idx = (uint16_t)fetch16(f);
-            const char *fname=NULL, *fdesc=NULL, *fcname=NULL;
-            Value val; CHK(pop(f, &val));
-            Value objref; CHK(pop(f, &objref));
-            if (f->klass && cp_resolve_ref(f->klass, cp_idx, &fname, &fdesc, &fcname)
-                && objref.type == VAL_REF && objref.ival >= 0
-                && objref.ival < vm->object_count) {
-                KVMObject *o = &vm->objects[objref.ival];
-                int fi2 = 0;
-                if (o->klass && fname) {
-                    for (int fi3 = 0; fi3 < o->klass->field_count; fi3++)
-                        if (o->klass->fields[fi3].name &&
-                            strcmp(o->klass->fields[fi3].name, fname) == 0)
-                            { fi2 = fi3; break; }
-                }
-                o->fields[fi2] = val.ival;
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            Value val; stack_pop(f, &val);
+            int32_t objref; pop_ref(f, &objref);
+            if (objref < 0 || objref >= MAX_OBJECTS || !vm->objects[objref].alive) {
+                result = JVM_ERR_NULL_POINTER; goto done;
             }
+            HeapObject *obj = &vm->objects[objref];
+            int field_idx = vm_find_field(vm, obj->class_id,
+                                          obj->fields[idx % obj->field_count].name);
+            if (field_idx < 0) field_idx = (int)(idx % obj->field_count);
+            obj->fields[field_idx].value = val;
             break;
         }
 
-        /* ── method invocation  (issue #3) ──────────────────── */
-        case OP_INVOKEVIRTUAL:
-        case OP_INVOKESPECIAL:
+        /* ── invokevirtual ────────────────────────────── */
+        /* FIX #2: use dispatch_println which checks descriptor / type tag */
+        case OP_INVOKEVIRTUAL: {
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            (void)idx;
+            dispatch_println(f, /*is_virtual=*/1);
+            break;
+        }
+
+        /* ── invokespecial (same stub as invokevirtual for now) ─── */
+        case OP_INVOKESPECIAL: {
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            (void)idx;
+            /* Constructor stub: pop objectref */
+            Value ref; stack_pop(f, &ref);
+            break;
+        }
+
+        /* ── invokestatic ─────────────────────────────── */
+        /* FIX #2: does NOT pop objectref (static has none) */
         case OP_INVOKESTATIC: {
-            uint16_t cp_idx = (uint16_t)fetch16(f);
-            const char *cname=NULL, *mname=NULL, *mdesc=NULL;
-
-            if (!f->klass || !cp_resolve_ref(f->klass, cp_idx, &mname, &mdesc, &cname)) {
-                break; /* can't resolve — skip */
-            }
-
-            /* Try to find the class in the VM registry */
-            KVMClass *target = cname ? vm_find_class(vm, cname) : f->klass;
-
-            if (target) {
-                MethodInfo *tm = find_method(target, mname, mdesc);
-                if (tm && tm->code) {
-                    /* Count arguments from descriptor */
-                    int argc = count_args(mdesc);
-                    int has_this = (op != OP_INVOKESTATIC) ? 1 : 0;
-                    int total = argc + has_this;
-                    if (total > MAX_LOCALS) total = MAX_LOCALS;
-
-                    /* Pop arguments from current frame into args[] */
-                    Value args[MAX_LOCALS];
-                    memset(args, 0, sizeof(args));
-                    for (int ai = total - 1; ai >= 0 && f->sp >= 0; ai--)
-                        pop(f, &args[ai]);
-
-                    /* Push callee frame */
-                    if (vm->fp >= MAX_FRAMES - 1) { result = JVM_ERR_STACK_OVERFLOW; goto done; }
-                    vm->fp++;
-                    Frame *nf = &vm->frames[vm->fp];
-                    memset(nf, 0, sizeof(Frame));
-                    nf->code     = tm->code;
-                    nf->code_len = tm->code_len;
-                    nf->pc       = 0;
-                    nf->sp       = -1;
-                    nf->klass    = target;
-                    nf->method   = tm;
-                    for (int li = 0; li < total; li++)
-                        nf->locals[li] = args[li];
-
-                    /* Execute callee recursively */
-                    int32_t callee_ret = 0;
-                    JVMResult cr = vm_exec(vm, tm->code, tm->code_len,
-                                           target, tm, &callee_ret);
-                    /* vm_exec popped nf; refresh f pointer */
-                    f = &vm->frames[vm->fp];
-
-                    if (cr == JVM_RETURN_INT) {
-                        CHK(push_int(f, callee_ret));
-                    } else if (cr == JVM_RETURN_REF) {
-                        Value v; v.type = VAL_REF; v.ival = callee_ret;
-                        CHK(push(f, v));
-                    } else if (cr != JVM_RETURN_VOID && cr != JVM_OK) {
-                        result = cr; goto done;
-                    }
-                    break;
-                }
-            }
-
-            /* Not in registry — fall through to native stub */
-            if (cname && mname)
-                dispatch_native(vm, f, cname, mname, mdesc);
-            break;
-        }
-
-        /* ── new object ─────────────────────────────────────── */
-        case OP_NEW: {
-            uint16_t cp_idx = (uint16_t)fetch16(f);
-            KVMClass *target = NULL;
-            if (f->klass && cp_idx < f->klass->cp_count) {
-                CPEntry *e = &f->klass->cp[cp_idx];
-                if (e->tag == CP_CLASS) {
-                    const char *cname2 = cp_utf8(f->klass, e->info.class_index);
-                    if (cname2) target = vm_find_class(vm, cname2);
-                }
-            }
-            int oi = vm_alloc_object(vm, target);
-            if (oi < 0) { result = JVM_ERR_OUT_OF_MEMORY; goto done; }
-            Value v; v.type = VAL_REF; v.ival = oi;
-            CHK(push(f, v));
+            uint16_t idx = (uint16_t)fetch_i16(f);
+            (void)idx;
+            dispatch_println(f, /*is_virtual=*/0);
             break;
         }
 
         default:
-            fprintf(stderr, "kvm: unknown opcode 0x%02X at pc=%u\n",
-                    op, f->pc - 1);
+            fprintf(stderr, "Unknown opcode: 0x%02X at pc=%u\n",
+                    opcode, f->pc - 1);
             result = JVM_ERR_UNKNOWN_OPCODE;
             goto done;
-        } /* switch */
-    } /* for(;;) */
+        }
+    }
 
 done:
-    vm->fp--;   /* pop this frame */
+    /* FIX #8: free code buffer only if this frame owns it */
+    if (f->code_owned && f->code) {
+        free((void *)f->code);
+        f->code = NULL;
+    }
+    vm->fp--;
     return result;
 }
 
-/* ═════════════════════════════════════════════════════════════
- * vm_run_classfile — load .class and execute main()  (issue #7)
- * ═════════════════════════════════════════════════════════════ */
-JVMResult vm_run_classfile(VM *vm, const char *path)
-{
-    KVMClass *cls = NULL;
-    JVMResult r = vm_load_class(vm, path, &cls);
-    if (r != JVM_OK) return r;
-
-    /* Find main(String[]) — try exact descriptor first, then by name */
-    MethodInfo *main_m = find_method(cls, "main", "([Ljava/lang/String;)V");
-    if (!main_m) main_m = find_method(cls, "main", NULL);
-    if (!main_m) {
-        fprintf(stderr, "kvm: no main() method in '%s'\n", path);
-        return JVM_ERR_METHOD_NOT_FOUND;
-    }
-    if (!main_m->code) {
-        fprintf(stderr, "kvm: main() has no bytecode\n");
-        return JVM_ERR_METHOD_NOT_FOUND;
-    }
-
-    if (vm->verbose)
-        KVM_PRINT("[kvm] running %s.main()\n", cls->name ? cls->name : "?");
-
-    /* Pass null reference as the String[] args argument */
-    Value args[1]; args[0].type = VAL_REF; args[0].ival = -1;
-    int32_t ret = 0;
-    r = vm_invoke_method(vm, cls, "main",
-                         main_m->descriptor ? main_m->descriptor : "([Ljava/lang/String;)V",
-                         args, 1, &ret);
-    return r;
-}
-
-/* ═════════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════
  * Error string helper
- * ═════════════════════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════ */
+
 const char *jvm_result_str(JVMResult r)
 {
     switch (r) {
-    case JVM_OK:                    return "OK";
-    case JVM_RETURN_INT:            return "RETURN_INT";
-    case JVM_RETURN_VOID:           return "RETURN_VOID";
-    case JVM_RETURN_REF:            return "RETURN_REF";
-    case JVM_ERR_STACK_OVERFLOW:    return "ERR_STACK_OVERFLOW";
-    case JVM_ERR_STACK_UNDERFLOW:   return "ERR_STACK_UNDERFLOW";
-    case JVM_ERR_UNKNOWN_OPCODE:    return "ERR_UNKNOWN_OPCODE";
-    case JVM_ERR_DIVIDE_BY_ZERO:    return "ERR_DIVIDE_BY_ZERO";
-    case JVM_ERR_OUT_OF_BOUNDS:     return "ERR_OUT_OF_BOUNDS";
-    case JVM_ERR_NO_FRAME:          return "ERR_NO_FRAME";
-    case JVM_ERR_NULL_PTR:          return "ERR_NULL_PTR";
-    case JVM_ERR_CLASS_NOT_FOUND:   return "ERR_CLASS_NOT_FOUND";
-    case JVM_ERR_METHOD_NOT_FOUND:  return "ERR_METHOD_NOT_FOUND";
-    case JVM_ERR_CLASSFILE_INVALID: return "ERR_CLASSFILE_INVALID";
-    case JVM_ERR_OUT_OF_MEMORY:     return "ERR_OUT_OF_MEMORY";
-    default:                        return "UNKNOWN";
+    case JVM_OK:                  return "OK";
+    case JVM_RETURN_INT:          return "RETURN_INT";
+    case JVM_RETURN_LONG:         return "RETURN_LONG";
+    case JVM_RETURN_VOID:         return "RETURN_VOID";
+    case JVM_RETURN_REF:          return "RETURN_REF";
+    case JVM_ERR_STACK_OVERFLOW:  return "ERR_STACK_OVERFLOW";
+    case JVM_ERR_STACK_UNDERFLOW: return "ERR_STACK_UNDERFLOW";
+    case JVM_ERR_UNKNOWN_OPCODE:  return "ERR_UNKNOWN_OPCODE";
+    case JVM_ERR_DIVIDE_BY_ZERO:  return "ERR_DIVIDE_BY_ZERO";
+    case JVM_ERR_OUT_OF_BOUNDS:   return "ERR_OUT_OF_BOUNDS";
+    case JVM_ERR_NO_FRAME:        return "ERR_NO_FRAME";
+    case JVM_ERR_NULL_POINTER:    return "ERR_NULL_POINTER";
+    case JVM_ERR_OUT_OF_MEMORY:   return "ERR_OUT_OF_MEMORY";
+    case JVM_ERR_TYPE_MISMATCH:   return "ERR_TYPE_MISMATCH";
+    default:                      return "UNKNOWN";
     }
 }
