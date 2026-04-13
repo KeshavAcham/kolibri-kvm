@@ -1,22 +1,12 @@
-# kolibri-kvm — Makefile
 CC      = gcc
-CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -O2
+CFLAGS  = -Wall -Wextra -std=c99 -O2 -g
 TARGET  = kvm
-SRCS    = main.c jvm.c classfile.c
-OBJS    = $(SRCS:.c=.o)
+SRCS    = jvm.c main.c
 
-all: $(TARGET)
-
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
-
-%.o: %.c jvm.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(TARGET): $(SRCS) jvm.h
+	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(TARGET)
 
-test: $(TARGET)
-	./$(TARGET)
-
-.PHONY: all clean test
+.PHONY: clean
